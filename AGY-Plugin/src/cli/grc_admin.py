@@ -34,11 +34,29 @@ from src.pii_guard.detector import PIIDetector
 
 
 def cmd_test_prompt(args: argparse.Namespace) -> None:
-    """Tests a prompt against both PII Regex and Model Armor security filters."""
-    prompt = args.prompt
+    """Tests a prompt or file against both PII Regex and Model Armor security filters."""
+    file_path = getattr(args, "file", None)
+    prompt_arg = getattr(args, "prompt", None)
+
+    if file_path:
+        resolved_path = os.path.abspath(os.path.expanduser(file_path))
+        if not os.path.isfile(resolved_path):
+            print(f"Error: File not found: {resolved_path}", file=sys.stderr)
+            sys.exit(2)
+        with open(resolved_path, "r", encoding="utf-8", errors="replace") as f:
+            file_content = f.read()
+        prompt = f"{prompt_arg}\n\n{file_content}" if prompt_arg else file_content
+    elif prompt_arg:
+        prompt = prompt_arg
+    else:
+        print("Error: Provide either a prompt string or --file / -f <path>.", file=sys.stderr)
+        sys.exit(2)
+
     print("=" * 80)
     print(" NANDI - PROMPT COMPLIANCE & SAFETY INSPECTION")
     print("=" * 80)
+    if file_path:
+        print(f"File: {os.path.abspath(os.path.expanduser(file_path))} ({len(prompt)} chars)")
     print(f"Prompt: {prompt}\n")
 
     # 1. PII Scan
@@ -351,8 +369,9 @@ def main() -> None:
     p_status.set_defaults(func=cmd_status)
 
     # test-prompt
-    p_test = subparsers.add_parser("test-prompt", help="Test a prompt against PII & Model Armor guardrails")
-    p_test.add_argument("prompt", help="Prompt text to inspect")
+    p_test = subparsers.add_parser("test-prompt", help="Test a prompt or file against PII & Model Armor guardrails")
+    p_test.add_argument("prompt", nargs="?", default=None, help="Prompt text to inspect")
+    p_test.add_argument("-f", "--file", dest="file", default=None, help="Path to file whose contents should be inspected")
     p_test.set_defaults(func=cmd_test_prompt)
 
     # test-entity

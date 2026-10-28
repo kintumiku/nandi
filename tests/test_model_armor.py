@@ -1,3 +1,4 @@
+import tempfile
 import io
 import json
 import os
@@ -387,6 +388,47 @@ model_armor:
             advanced_payload = json.loads(mock_out_advanced.getvalue())
             self.assertEqual(advanced_payload["sdp_mode"], "ADVANCED")
             self.assertEqual(advanced_payload["location"], "us-east1")
+
+
+    @patch.object(ModelArmorClient, "sanitize_user_prompt")
+    def test_grc_admin_test_prompt_with_file_flag(self, mock_sanitize: MagicMock) -> None:
+        """Verifies grc_admin.py test-prompt --file / -f inspects file contents and handles missing files."""
+        from src.cli.grc_admin import main as grc_admin_main
+        from src.model_armor.client import ModelArmorResponse
+
+        mock_sanitize.return_value = ModelArmorResponse(
+            success=True,
+            raw_response={},
+            filter_match_state="NO_MATCH_FOUND",
+            invocation_result="SUCCESS",
+            filter_results={},
+            latency_ms=8.5,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pii_file = os.path.join(tmpdir, "sample_pii.txt")
+            with open(pii_file, "w", encoding="utf-8") as f:
+                f.write("Applicant PAN: ABCPE1234F\n")
+
+            with patch(
+                "sys.argv", ["grc_admin.py", "test-prompt", "--file", pii_file]
+            ), patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+                grc_admin_main()
+
+            output = mock_out.getvalue()
+            self.assertIn("File:", output)
+            self.assertIn("Contains PII: YES (VIOLATION)", output)
+            self.assertIn("FINAL DECISION: >>> DENY / BLOCK <<<", output)
+            mock_sanitize.assert_called_once_with("Applicant PAN: ABCPE1234F\n")
+
+            missing_file = os.path.join(tmpdir, "does_not_exist.txt")
+            with patch(
+                "sys.argv", ["grc_admin.py", "test-prompt", "-f", missing_file]
+            ), patch("sys.stderr", new_callable=io.StringIO) as mock_err:
+                with self.assertRaises(SystemExit) as ctx:
+                    grc_admin_main()
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertIn("File not found", mock_err.getvalue())
 
 
 if __name__ == "__main__":
