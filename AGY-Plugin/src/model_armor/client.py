@@ -3,6 +3,7 @@
 import dataclasses
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -56,6 +57,31 @@ class ModelArmorResponse:
     latency_ms: float = 0.0
 
 
+# Maps each config.yaml field to its override environment variable and fallback default.
+_CONFIG_FIELDS: Dict[str, Dict[str, str]] = {
+    "project_id": {"env": "MODEL_ARMOR_PROJECT_ID", "default": "your-gcp-project-id"},
+    "location": {"env": "MODEL_ARMOR_LOCATION", "default": "asia-south1"},
+    "template_id": {"env": "MODEL_ARMOR_TEMPLATE_ID", "default": "Nandi-compliance-template"},
+}
+
+
+def _resolve_config_field(
+    key: str, arg_value: str, cfg_values: Dict[str, str]
+) -> str:
+    """Resolves a config key with precedence: env var > non-default arg > config.yaml > default."""
+    field_spec = _CONFIG_FIELDS[key]
+    default_value = field_spec["default"]
+    cfg_value = cfg_values.get(key)
+    if cfg_value == "YOUR_GCP_PROJECT_ID":
+        cfg_value = None
+    return (
+        os.environ.get(field_spec["env"])
+        or (arg_value if arg_value != default_value else None)
+        or cfg_value
+        or arg_value
+    )
+
+
 class ModelArmorClient:
     """Client for Google Cloud Model Armor API (modelarmor.googleapis.com)."""
 
@@ -71,29 +97,33 @@ class ModelArmorClient:
         timeout_seconds: float = 5.0,
         retry_attempts: int = 2,
     ):
-        # Resolve project_id: environment variable > config.yaml > parameter default
-        env_pid = os.environ.get("MODEL_ARMOR_PROJECT_ID")
-        if env_pid:
-            self.project_id = env_pid
-        else:
-            cfg_pid = None
-            try:
-                cfg_file = os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-                    "config",
-                    "config.yaml"
-                )
-                if os.path.exists(cfg_file):
-                    import re
-                    with open(cfg_file, "r", encoding="utf-8") as f:
-                        m = re.search(r'project_id:\s*["\']([^"\']+)["\']', f.read())
-                        if m:
-                            cfg_pid = m.group(1)
-            except Exception:
-                pass
-            self.project_id = cfg_pid or project_id
-        self.location = os.environ.get("MODEL_ARMOR_LOCATION", location)
-        self.template_id = os.environ.get("MODEL_ARMOR_TEMPLATE_ID", template_id)
+        cfg_values: Dict[str, str] = {}
+        try:
+            cfg_file = os.path.join(
+                os.path.dirname(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                ),
+                "config",
+                "config.yaml",
+            )
+            if os.path.exists(cfg_file):
+                with open(cfg_file, "r", encoding="utf-8") as cfg_fh:
+                    cfg_text = cfg_fh.read()
+                for key in _CONFIG_FIELDS:
+                    match = re.search(
+                        rf'^\s*{key}:\s*["\']?([^"\'#\r\n]+)["\']?',
+                        cfg_text,
+                        re.MULTILINE,
+                    )
+                    if match:
+                        cfg_values[key] = match.group(1).strip()
+        except OSError:
+            # Fall back to environment or default values if config.yaml cannot be read.
+            pass
+
+        self.project_id = _resolve_config_field("project_id", project_id, cfg_values)
+        self.location = _resolve_config_field("location", location, cfg_values)
+        self.template_id = _resolve_config_field("template_id", template_id, cfg_values)
         self.endpoint = endpoint or os.environ.get("MODEL_ARMOR_ENDPOINT")
         self.timeout_seconds = timeout_seconds
         self.retry_attempts = retry_attempts
