@@ -1,0 +1,11 @@
+# Nandi AGY-Plugin Ignore Rules
+logs/
+!logs/.gitkeep
+AGY-Plugin/logs/
+!AGY-Plugin/logs/.gitkeep
+*.log
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.DS_Store

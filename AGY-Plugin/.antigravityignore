@@ -1,0 +1,9 @@
+# Prevent Antigravity / Gemini from indexing runtime audit logs and virtual environments
+logs/
+!logs/.gitkeep
+AGY-Plugin/logs/
+!AGY-Plugin/logs/.gitkeep
+*.log
+.venv/
+venv/
+__pycache__/

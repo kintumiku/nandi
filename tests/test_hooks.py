@@ -3,8 +3,10 @@
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -23,6 +25,19 @@ from src.pii_guard.checksums import verhoeff_generate
 
 class TestHooks(unittest.TestCase):
 
+    def setUp(self) -> None:
+        self._tmp_dir = tempfile.mkdtemp(prefix="nandi_test_hooks_")
+        self._audit_log_path = os.path.join(self._tmp_dir, "fsi_audit.log")
+        self._prev_audit_env = os.environ.get("FSI_AUDIT_LOG_PATH")
+        os.environ["FSI_AUDIT_LOG_PATH"] = self._audit_log_path
+
+    def tearDown(self) -> None:
+        if self._prev_audit_env is None:
+            os.environ.pop("FSI_AUDIT_LOG_PATH", None)
+        else:
+            os.environ["FSI_AUDIT_LOG_PATH"] = self._prev_audit_env
+        shutil.rmtree(self._tmp_dir, ignore_errors=True)
+
     def _invoke_hook(self, script_path, payload, env_override=None, expect_exit_code=0):
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         if script_path.startswith("AGY-Plugin/"):
@@ -32,6 +47,7 @@ class TestHooks(unittest.TestCase):
         else:
             full_script_path = os.path.join(repo_root, "AGY-Plugin", script_path)
         env = dict(os.environ)
+        env["FSI_AUDIT_LOG_PATH"] = self._audit_log_path
         if env_override:
             env.update(env_override)
 

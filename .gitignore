@@ -46,8 +46,13 @@ venv.bak/
 Thumbs.db
 
 # Dynamic Logs (preserve directory via .gitkeep)
+logs/
+!logs/.gitkeep
 logs/*.log
+AGY-Plugin/logs/
+!AGY-Plugin/logs/.gitkeep
 AGY-Plugin/logs/*.log
+*.log
 
 # Terraform local state and files in GCP/
 GCP/terraform/.terraform/

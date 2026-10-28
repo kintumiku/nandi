@@ -69,6 +69,9 @@ jobs:
             # Plugin manifests & metadata
             cp -p AGY-Plugin/plugin.json "${target_dir}/"
             cp -p AGY-Plugin/hooks.json "${target_dir}/"
+            cp -p AGY-Plugin/.gitignore "${target_dir}/"
+            cp -p AGY-Plugin/.geminiignore "${target_dir}/"
+            cp -p AGY-Plugin/.antigravityignore "${target_dir}/"
             cp -p README.md "${target_dir}/"
 
             # Core components: config, rules, skills, src

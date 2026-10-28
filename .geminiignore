@@ -1,0 +1,11 @@
+# Prevent Antigravity / Gemini from indexing runtime audit logs and environments
+logs/
+!logs/.gitkeep
+AGY-Plugin/logs/
+!AGY-Plugin/logs/.gitkeep
+*.log
+.venv/
+venv/
+__pycache__/
+GCP/terraform/.terraform/
+GCP/terraform/*.tfstate*
