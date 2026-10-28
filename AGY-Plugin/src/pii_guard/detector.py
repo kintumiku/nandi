@@ -16,6 +16,7 @@ from src.pii_guard.checksums import (
     phone_in_validate,
     dl_in_validate,
     passport_in_validate,
+    voter_id_validate,
     cin_in_validate,
     pin_code_validate,
 )
@@ -90,6 +91,8 @@ class PIIDetector:
             return dl_in_validate(raw_value)
         elif algo == "passport_in_structure":
             return passport_in_validate(raw_value)
+        elif algo == "voter_id_structure":
+            return voter_id_validate(raw_value)
         elif algo == "cin_structure":
             return cin_in_validate(raw_value)
         elif algo == "pin_code_validation":

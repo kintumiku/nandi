@@ -4,7 +4,7 @@ Includes:
 - Verhoeff Algorithm (D5 Dihedral Group) for Aadhaar 12-digit UIDAI validation.
 - Luhn Algorithm (Mod 10) for Payment Cards (RuPay, Visa, Mastercard).
 - Mod 36 Algorithm for GSTIN 15-character verification.
-- Structural algorithms for PAN, IFSC, UPI, Phone, DL, Passport, CIN, and PIN code.
+- Structural algorithms for PAN, IFSC, UPI, Phone, DL, Passport, Voter ID, CIN, and PIN code.
 """
 
 import re
@@ -249,11 +249,7 @@ def upi_validate(vpa_str: str) -> bool:
     if not re.match(r"^[a-z0-9.\-_]+$", username):
         return False
 
-    if handle in _KNOWN_UPI_HANDLES:
-        return True
-
-    # Generic valid alphanumeric domain handle
-    return bool(re.match(r"^[a-z]{3,30}$", handle))
+    return handle in _KNOWN_UPI_HANDLES
 
 
 # ==============================================================================
@@ -317,15 +313,80 @@ def passport_in_validate(passport_str: str) -> bool:
     """Validates Indian Passport Number (8 alphanumeric characters).
 
     First character is an uppercase letter (excluding Q, X, Z),
-    followed by 7 digits (first digit 1-9).
+    followed by 7 digits (first digit 1-9, last digit 1-9).
     """
-    cleaned = re.sub(r"\s", "", passport_str).upper()
+    cleaned = re.sub(r"\s", "", passport_str)
     if len(cleaned) != 8:
         return False
 
-    # Pattern: 1 letter (A-P, R-W, Y) + digit 1-9 + 6 digits
-    pattern = r"^[A-PR-WYa-pr-wy][1-9]\d{6}$"
+    # Pattern: 1 uppercase letter (A-P, R-W, Y) + digit 1-9 + 5 digits + digit 1-9
+    pattern = r"^[A-PR-WY][1-9]\d{5}[1-9]$"
     return bool(re.match(pattern, cleaned))
+
+
+# ==============================================================================
+# Indian Voter ID (EPIC) Validation
+# ==============================================================================
+
+_NON_EPIC_PREFIXES = {
+    "ABC", "ADD", "ADM", "API", "APP", "ARG", "AWS", "BCH", "BIN", "BLK",
+    "BOT", "BRK", "BTN", "BUG", "CFG", "CHK", "CLI", "CLN", "CLS", "CMD",
+    "CMP", "CNT", "COL", "COM", "CON", "CPU", "CRD", "CRT", "CSV", "CTX",
+    "CUR", "CVE", "CWE", "DAT", "DBG", "DEC", "DEF", "DEL", "DEP", "DEV",
+    "DIR", "DOC", "DOM", "DRV", "DST", "DTO", "DUM", "ENC", "END", "ENG",
+    "ENT", "ENV", "EOF", "EOL", "ERR", "EVT", "EXC", "EXE", "EXP", "EXT",
+    "fAK", "FAK", "FIG", "FIL", "FIX", "FLG", "FLT", "FMT", "FNC", "FOO",
+    "FRM", "FSI", "FUN", "GCP", "GEN", "GET", "GIT", "GLB", "GRP", "GUI",
+    "GWS", "HDR", "HEX", "HLP", "HND", "HST", "HTM", "IAM", "ICN", "IDX",
+    "IMG", "IMP", "INC", "IND", "INF", "INI", "INP", "INR", "INS", "INT",
+    "INV", "IPC", "ISO", "ISS", "ITM", "JOB", "JSN", "JWT", "KEY", "KMS",
+    "LBL", "LEN", "LIB", "LIM", "LNK", "LOC", "LOG", "LST", "LUH", "MAC",
+    "MAP", "MAX", "MEM", "MET", "MGR", "MIN", "MOD", "MON", "MSG", "MTX",
+    "NAM", "NET", "NEW", "NIL", "NOD", "NON", "NUM", "OBJ", "OID", "OLD",
+    "OPT", "ORD", "ORG", "OUT", "OWN", "PAD", "PAG", "PAN", "PAR", "PAS",
+    "PAT", "PAY", "PDF", "PEM", "PER", "PID", "PII", "PIN", "PKG", "PLN",
+    "PLX", "PNG", "POD", "POL", "POS", "PRD", "PRE", "PRI", "PRJ", "PRO",
+    "PRP", "PRT", "PRV", "PSW", "PTR", "PUB", "PUT", "PWD", "PYT", "QRY",
+    "QUE", "RAW", "RBI", "RCD", "RCV", "RDB", "RDR", "REC", "RED", "REF",
+    "REG", "REL", "REM", "REP", "REQ", "RES", "RET", "REV", "RFC", "RLE",
+    "RND", "RNG", "ROL", "ROT", "ROW", "RPC", "RPT", "RSA", "RSP", "RST",
+    "RTE", "RUN", "RVW", "SAN", "SCH", "SCN", "SCR", "SDK", "SDP", "SEC",
+    "SED", "SEL", "SEM", "SEN", "SEQ", "SER", "SES", "SET", "SEV", "SHA",
+    "SHL", "SIG", "SIM", "SIZ", "SKP", "SLA", "SLC", "SLD", "SLO", "SLT",
+    "SML", "SMP", "SMS", "SND", "SNP", "SOC", "SPC", "SPD", "SPL", "SQL",
+    "SRC", "SRV", "SSH", "SSL", "SSO", "STA", "STD", "STM", "STP", "STR",
+    "STS", "STT", "SUB", "SUC", "SUM", "SUP", "SVC", "SVG", "SVN", "SWP",
+    "SYM", "SYN", "SYS", "TAB", "TAG", "TAR", "TBL", "TCK", "TCP", "TDD",
+    "TDR", "TKT", "TLS", "TMP", "TKN", "TOK", "TPL", "TRC", "TRG", "TRM",
+    "TRN", "TRS", "TRY", "TSK", "TST", "TTL", "TXT", "TYP", "UDP", "UID",
+    "UIX", "UNK", "UPD", "UPI", "URI", "URL", "USA", "USB", "USD", "USE",
+    "USR", "UTC", "UTF", "UTL", "UUID", "VAL", "VAR", "VCS", "VEC", "VER",
+    "VID", "VIEW", "VMX", "VPC", "VPN", "VPA", "VRF", "VRS", "WBG", "WEB",
+    "WIN", "WKR", "WRK", "WRN", "WSS", "XML", "XPK", "XSS", "XYZ", "YML",
+    "ZIP", "ZIP", "ZON",
+}
+
+
+def voter_id_validate(voter_id_str: str) -> bool:
+    """Validates Indian Electoral Photo Identity Card (EPIC / Voter ID).
+
+    Structure: 3 uppercase letters followed by 7 digits.
+    Rejects common software/ticket prefixes (e.g., BUG, REQ, ERR, SHA, CVE)
+    and degenerate digit sequences (all zeros or all identical digits).
+    """
+    cleaned = voter_id_str.strip()
+    if len(cleaned) != 10:
+        return False
+    if not re.match(r"^[A-Z]{3}\d{7}$", cleaned):
+        return False
+
+    prefix = cleaned[:3]
+    digits = cleaned[3:]
+    if prefix in _NON_EPIC_PREFIXES:
+        return False
+    if int(digits) == 0 or len(set(digits)) == 1:
+        return False
+    return True
 
 
 # ==============================================================================

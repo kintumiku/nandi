@@ -42,7 +42,7 @@
         "SEBI_CSCRF_2024",
         "DPDP_ACT_2023"
       ],
-      "regex": "\\b[A-PR-WYa-pr-wy][1-9]\\d\\s?\\d{4}[1-9]\\b",
+      "regex": "\\b[A-PR-WY][1-9]\\d\\s?\\d{4}[1-9]\\b",
       "checksum_algorithm": "passport_in_structure",
       "description": "8-character Indian Passport number starting with an uppercase letter (excluding Q, X, Z), followed by 7 digits.",
       "masking_pattern": "{first1}XXXXXX{last1}"
@@ -136,7 +136,7 @@
         "NPCI_UPI_SECURITY_CIRCULARS",
         "DPDP_ACT_2023"
       ],
-      "regex": "\\b[a-zA-Z0-9._-]{2,64}@(?:okaxis|okicici|oksbi|okhdfcbank|paytm|ybl|ibl|axl|apl|upi|postbank|barodampay|federal|kotak|indus|pnb|allbank|cnrb|sbi|aubank|idbi|boi|unionbank|equitas|fbl|rbl|pingpay|slice|jupiteraxis|cred|freecharge|mobikwik|amazonpay|airtel)\\b|\\b[a-zA-Z0-9._-]{3,64}@[a-zA-Z]{3,30}\\b",
+      "regex": "\\b[a-zA-Z0-9._-]{2,64}@(?:okaxis|okicici|oksbi|okhdfcbank|paytm|ybl|ibl|axl|apl|upi|postbank|barodampay|federal|kotak|indus|pnb|allbank|cnrb|sbi|aubank|idbi|boi|unionbank|equitas|fbl|rbl|pingpay|slice|jupiteraxis|cred|freecharge|mobikwik|amazonpay|airtel)\\b(?!(?:\\.[a-zA-Z0-9]|[-\\w]))",
       "checksum_algorithm": "upi_handle_validation",
       "description": "Virtual Payment Address used for real-time payments across NPCI Unified Payments Interface network.",
       "masking_pattern": "{first2}***@{handle}"
