@@ -1,9 +1,10 @@
+import io
 import json
 import os
 import sys
 import unittest
 import urllib.error
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, mock_open, patch
 
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 plugin_root = os.path.join(repo_root, "AGY-Plugin")
@@ -236,7 +237,157 @@ class TestModelArmor(unittest.TestCase):
         self.assertIn("Authentication failed", res["error_message"])
 
 
+    def test_yaml_config_resolution_and_env_precedence(self) -> None:
+        yaml_text = """
+model_armor:
+  enabled: true
+  project_id: "fsi-prod-project-01"
+  location: "us-east1"
+  template_id: "fsi-us-east1-template"
+"""
+        env_clean = {
+            "MODEL_ARMOR_PROJECT_ID": "",
+            "MODEL_ARMOR_LOCATION": "",
+            "MODEL_ARMOR_TEMPLATE_ID": "",
+            "MODEL_ARMOR_ENDPOINT": "",
+        }
+        with patch("os.path.exists", return_value=True), patch(
+            "builtins.open", mock_open(read_data=yaml_text)
+        ), patch.dict(os.environ, env_clean, clear=False):
+            client_yaml = ModelArmorClient()
+            self.assertEqual(client_yaml.project_id, "fsi-prod-project-01")
+            self.assertEqual(client_yaml.location, "us-east1")
+            self.assertEqual(client_yaml.template_id, "fsi-us-east1-template")
+
+            # Explicit non-default constructor args override config.yaml.
+            client_arg = ModelArmorClient(
+                project_id="arg-project",
+                location="europe-west1",
+                template_id="arg-template",
+            )
+            self.assertEqual(client_arg.project_id, "arg-project")
+            self.assertEqual(client_arg.location, "europe-west1")
+            self.assertEqual(client_arg.template_id, "arg-template")
+
+        # MODEL_ARMOR_* env vars override both constructor args and YAML.
+        env_override = {
+            "MODEL_ARMOR_PROJECT_ID": "env-project-99",
+            "MODEL_ARMOR_LOCATION": "us-east1",
+            "MODEL_ARMOR_TEMPLATE_ID": "env-template-99",
+        }
+        with patch("os.path.exists", return_value=True), patch(
+            "builtins.open", mock_open(read_data=yaml_text)
+        ), patch.dict(os.environ, env_override, clear=False):
+            client_env = ModelArmorClient(
+                project_id="arg-project",
+                location="asia-south1",
+                template_id="arg-template",
+            )
+            self.assertEqual(client_env.project_id, "env-project-99")
+            self.assertEqual(client_env.location, "us-east1")
+            self.assertEqual(client_env.template_id, "env-template-99")
+
+    def test_placeholder_project_id_ignored_in_yaml(self) -> None:
+        yaml_text = """
+model_armor:
+  project_id: "YOUR_GCP_PROJECT_ID"
+  location: "us-east1"
+  template_id: "Nandi-compliance-template"
+"""
+        env_clean = {
+            "MODEL_ARMOR_PROJECT_ID": "",
+            "MODEL_ARMOR_LOCATION": "",
+        }
+        with patch("os.path.exists", return_value=True), patch(
+            "builtins.open", mock_open(read_data=yaml_text)
+        ), patch.dict(os.environ, env_clean, clear=False):
+            client = ModelArmorClient()
+            self.assertEqual(client.project_id, "your-gcp-project-id")
+            self.assertEqual(client.location, "us-east1")
+
+    @patch.object(ModelArmorClient, "sanitize_user_prompt")
+    @patch.object(ModelArmorClient, "get_template")
+    def test_grc_admin_status_verify_json(
+        self, mock_get_template: MagicMock, mock_sanitize: MagicMock
+    ) -> None:
+        from src.cli.grc_admin import main as grc_admin_main
+        from src.model_armor.client import ModelArmorResponse
+
+        mock_get_template.return_value = {
+            "success": True,
+            "status_code": 200,
+            "template": {
+                "name": (
+                    "projects/fsi-proj/locations/us-east1"
+                    "/templates/Nandi-compliance-template"
+                ),
+                "filterConfig": {
+                    "sdpSettings": {
+                        "basicConfig": {"filterEnforcement": "ENABLED"}
+                    }
+                },
+            },
+        }
+        mock_sanitize.return_value = ModelArmorResponse(
+            success=True,
+            raw_response={},
+            filter_match_state="NO_MATCH_FOUND",
+            invocation_result="SUCCESS",
+            filter_results={},
+            latency_ms=12.4,
+        )
+
+        env_vars = {
+            "MODEL_ARMOR_PROJECT_ID": "fsi-proj",
+            "MODEL_ARMOR_LOCATION": "us-east1",
+            "MODEL_ARMOR_TEMPLATE_ID": "Nandi-compliance-template",
+        }
+        with patch.dict(os.environ, env_vars, clear=False):
+            with patch(
+                "sys.argv", ["grc_admin.py", "status", "--verify", "--json"]
+            ), patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+                grc_admin_main()
+            status_payload = json.loads(mock_out.getvalue())
+            self.assertEqual(status_payload["project_id"], "fsi-proj")
+            self.assertEqual(status_payload["location"], "us-east1")
+            self.assertEqual(
+                status_payload["endpoint"],
+                "modelarmor.us-east1.rep.googleapis.com",
+            )
+            self.assertEqual(status_payload["sdp_mode"], "BASIC")
+            self.assertEqual(
+                status_payload["verification"]["verified"], True
+            )
+            self.assertEqual(
+                status_payload["verification"]["local_pii_scanner_ok"], True
+            )
+
+            mock_get_template.return_value = {
+                "success": True,
+                "status_code": 200,
+                "template": {
+                    "filterConfig": {
+                        "sdpSettings": {
+                            "advancedConfig": {
+                                "inspectTemplate": (
+                                    "projects/fsi-proj/locations/us-east1"
+                                    "/inspectTemplates/fsi-dlp"
+                                )
+                            }
+                        }
+                    }
+                },
+            }
+            with patch(
+                "sys.argv", ["grc_admin.py", "status", "--verify", "--json"]
+            ), patch(
+                "sys.stdout", new_callable=io.StringIO
+            ) as mock_out_advanced:
+                grc_admin_main()
+            advanced_payload = json.loads(mock_out_advanced.getvalue())
+            self.assertEqual(advanced_payload["sdp_mode"], "ADVANCED")
+            self.assertEqual(advanced_payload["location"], "us-east1")
+
+
 if __name__ == "__main__":
     unittest.main()
-
-
