@@ -13,6 +13,15 @@ environment: "production" # development, staging, production
 #   - AUDIT: Silent mode; logs compliance violations without interrupting flow
 enforcement_mode: "BLOCK"
 
+# Workspace & External File Content Scanning Policy
+file_scanning:
+  enabled: true # true, false
+  mode: "prompt_only" # prompt_only, untrusted_and_prompt, all
+  max_file_size_bytes: 2097152 # 46080 to 4194304
+  oversize_action: "TRUNCATE" # TRUNCATE, BLOCK
+  unpaged_scan_mode: "single" # single, chunk, block
+  state_ttl_seconds: 86400 # 300 to 604800
+
 # PII Regex & Pattern Matching Engine Configuration
 pii_guard:
   enabled: true

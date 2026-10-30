@@ -40,10 +40,14 @@ def main() -> None:
             hook.reply_deny(f"🛡️ [Unified Gate] Execution denied: Turn flagged for security policy violation ({block_reason})")
             return
 
-        text_to_scan, source = hook.extract_text_to_scan()
-        if not text_to_scan.strip():
+        extraction = hook.extract_scan_target()
+        if extraction.action == "BLOCK_POLICY":
+            hook.reply_deny(f"🛡️ [Unified Security Gate] {extraction.block_reason}")
+            return
+        if extraction.action in ("SKIP_CACHED", "NO_ACTIONABLE_TEXT") or not extraction.text_to_scan.strip():
             hook.reply_allow("No actionable text in tool arguments")
             return
+        text_to_scan, source = extraction.text_to_scan, extraction.source
 
         # Phase 1: Tool Args Regex Check
         pii_report = detector.scan(text_to_scan, action_mode="BLOCK")
@@ -68,8 +72,7 @@ def main() -> None:
             return
 
         # Phase 2: Tool Args Model Armor Check
-        response = client.sanitize_user_prompt(text_to_scan)
-        eval_report = evaluator.evaluate(response)
+        eval_report = hook.evaluate_model_armor(client, evaluator, text_to_scan)
         if not eval_report.is_allowed:
             audit_logger.log_event(
                 hook_name="fsi-unified-guard",
@@ -94,11 +97,14 @@ def main() -> None:
         return
 
     # 3. PreInvocation Handling
-    hook.clear_turn_blocked()
-    text_to_scan, source = hook.extract_text_to_scan()
-    if not text_to_scan.strip():
+    extraction = hook.extract_scan_target()
+    if extraction.action == "BLOCK_POLICY":
+        hook.reply_block_pre_invocation(f"🛡️ [Unified Security Gate] {extraction.block_reason}")
+        return
+    if extraction.action in ("SKIP_CACHED", "NO_ACTIONABLE_TEXT") or not extraction.text_to_scan.strip():
         hook.reply_pre_invocation()
         return
+    text_to_scan, source = extraction.text_to_scan, extraction.source
 
     # Phase 1: Fast-Path Regex & Algorithmic Checksum PII Inspection (<1ms)
     pii_report = detector.scan(text_to_scan, action_mode="BLOCK")
@@ -124,8 +130,7 @@ def main() -> None:
         return
 
     # Phase 2: Deep Model Armor Security & AI Safety Inspection
-    response = client.sanitize_user_prompt(text_to_scan)
-    eval_report = evaluator.evaluate(response)
+    eval_report = hook.evaluate_model_armor(client, evaluator, text_to_scan)
 
     if not eval_report.is_allowed:
         audit_logger.log_event(

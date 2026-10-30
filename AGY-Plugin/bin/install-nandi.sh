@@ -266,6 +266,8 @@ REQUIRED_FILES=(
   "config/config.yaml"
   "config/pii_patterns.json"
   "config/model_armor_policy.json"
+  "src/file_guard/__init__.py"
+  "src/file_guard/scanner.py"
   "src/hooks/hook_base.py"
   "src/hooks/pii_hook.py"
   "src/hooks/model_armor_hook.py"
