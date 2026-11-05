@@ -1,182 +1,150 @@
-"""Policy-driven file slice reader and Git workspace trust evaluator.
+"""Policy-driven pre-read file slice extractor and multimodal media classifier.
 
-This module isolates all filesystem, Git status, shell argument extraction, and
-line/byte-slicing logic from the Antigravity hook wire protocol (`src.hooks`)
-so both lifecycle hooks and the administrative CLI (`src.cli.grc_admin`) share
-a single, zero-dependency implementation.
+Isolates filesystem URI resolution, streaming UTF-8/binary classification,
+paged line/byte window slicing (`read_file` and `view_file`), and structured
+Jupyter notebook cell extraction (`notebook_edit`) from the Antigravity hook
+wire protocol (`src.hooks`).
 """
 
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
 import dataclasses
 import json
 import os
 import re
-import shlex
 import stat
-import subprocess
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any
+import urllib.parse
+import urllib.request
 
 # ---------------------------------------------------------------------------
-# File-Scanning & Slicing Constants (Aligned with Antigravity ReadFileTool)
+# File-Scanning & Slicing Constants (Aligned with Antigravity & Nandi v2)
 # ---------------------------------------------------------------------------
 
-# Matches Antigravity's ReadFileTool per-view line cap (MaxLinesPerView = 800
-# in cortex/config/defaults.go) so a single paged read inspects the exact line
-# window returned to the model.
+# Matches Antigravity's per-view line cap (MaxLinesPerView = 800).
 MAX_SCAN_LINES_PER_VIEW: int = 800
 
-# Matches Antigravity's ReadFileTool per-view byte ceiling (MaxBytesPerView =
-# 45 * 1024 = 46,080 bytes in cortex/config/defaults.go), eliminating any blind
-# spot between 40,000 characters and 46,080 bytes while staying below Cloud
-# DLP's 50 KB single-request inspection threshold.
+# Matches Antigravity's per-view byte ceiling (45 * 1024 = 46,080 bytes).
 MAX_SCAN_BYTES_PER_VIEW: int = 46_080
 
-# Matches Antigravity's ReadFileTool maximum file size (MaxFileSizeBytes =
-# 100 * 1024 * 1024 = 100 MiB in cortex/config/defaults.go) for streaming
-# line-paged reads (read_file / view_file).
+# Backward UTF-8-aligned byte overlap applied when ByteOffset/ContentOffset > 0
+# so multi-byte tokens straddling a 46,080-byte boundary remain intact.
+BYTE_OFFSET_OVERLAP_BYTES: int = 512
+
+# Single-request UTF-8 byte ceiling (48 KiB): fits 46,080 B + 512 B overlap +
+# normal toolCall.args in 1 Model Armor RPC while staying under Cloud DLP's
+# ~50 KB single-request inspection window.
+MAX_SINGLE_SHOT_SCAN_BYTES: int = 49_152
+
+# Maximum characters inspected in a single PreToolUse / PreInvocation scan
+# (<= 7 chunks of 40,000 chars with 4,096-char overlap).
+MAX_PRE_READ_SCAN_CHARS: int = 250_000
+
+# Multi-chunk character window and overlap for oversized notebook/prompt scans.
+MULTI_CHUNK_MAX_CHARS: int = 40_000
+MULTI_CHUNK_OVERLAP_CHARS: int = 4_096
+
+# Maximum .ipynb file size (10 MiB) parsed in PreToolUse before failing closed.
+NOTEBOOK_MAX_FILE_BYTES: int = 10_485_760
+
+# Matches Antigravity's maximum file size (100 MiB) for read_file / view_file.
 MAX_PAGED_FILE_SIZE_BYTES: int = 104_857_600
 
-# Default 2 MiB ceiling for unpaginated tool reads (grep_search, notebook_edit,
-# run_command file dumps) where the entire file could otherwise be ingested at
-# once without line pagination.
-DEFAULT_MAX_UNPAGED_FILE_BYTES: int = 2_097_152
-DEFAULT_UNPAGED_MAX_FILE_BYTES: int = DEFAULT_MAX_UNPAGED_FILE_BYTES
+# Header sniff window matching Go net/http.DetectContentType (512 bytes).
+MIME_SNIFF_BYTES: int = 512
+BINARY_SNIFF_BYTES: int = MIME_SNIFF_BYTES
 
-# Customer-configurable bounds for max_file_size_bytes ([45 KiB, 4 MiB]) so
-# policies cannot be set smaller than one read_file page or large enough to
-# exhaust hook execution timeouts.
-MIN_CONFIGURABLE_UNPAGED_BYTES: int = 46_080
-MAX_CONFIGURABLE_UNPAGED_BYTES: int = 4_194_304
+# Streaming chunk size (64 KiB) for O(1)-memory UTF-8 and NUL-byte validation.
+STREAM_CHUNK_BYTES: int = 65_536
 
-# Matches standard OS 4 KiB memory page size and Git's binary-buffer sniff
-# window: after checking for UTF-16LE/BE BOMs (\xff\xfe / \xfe\xff), any NUL
-# byte (\x00) in the first 4,096 bytes classifies the file as binary.
-BINARY_SNIFF_BYTES: int = 4_096
+# Content-addressed LRU cache retention and capacity constants.
+SCAN_CACHE_TTL_SECONDS: int = 7_200
+SCAN_CACHE_MAX_ENTRIES: int = 2_000
 
-# Backward UTF-8-aligned byte overlap applied when ByteOffset > 0 so multi-char
-# Indian PII tokens (12-digit Aadhaar, 16-digit card numbers, 15-char GSTIN)
-# straddling a 46,080-byte page boundary remain intact on the continuation page.
-BYTE_OFFSET_OVERLAP_BYTES: int = 128
-
-# Subprocess timeout for batched `git status --porcelain=v1` checks, bounded
-# well inside the 15-second hook timeout and failing closed (untrusted) on error.
-GIT_STATUS_TIMEOUT_SECONDS: float = 3.0
-
-VALID_SCAN_MODES: Tuple[str, ...] = (
-    "untrusted_and_prompt",
-    "all",
-    "prompt_only",
+PAGED_FILE_READ_TOOLS: frozenset[str] = frozenset({"read_file", "view_file"})
+NOTEBOOK_READ_ACTIONS: frozenset[str] = frozenset(
+    {"list", "get", "get_with_outputs"}
 )
-VALID_OVERSIZE_ACTIONS: Tuple[str, ...] = ("BLOCK", "TRUNCATE")
-VALID_UNPAGED_SCAN_MODES: Tuple[str, ...] = ("single", "chunk", "block")
-DEFAULT_STATE_TTL_SECONDS: int = 86_400
-MIN_STATE_TTL_SECONDS: int = 300
-MAX_STATE_TTL_SECONDS: int = 604_800
-MAX_DIR_EXPANSION_FILES: int = 64
+VALID_UNSCANNABLE_MEDIA_ACTIONS: tuple[str, ...] = ("BLOCK", "ALLOW")
 
-SHELL_SEARCH_COMMANDS: Set[str] = {
-    "rg",
-    "grep",
-    "egrep",
-    "fgrep",
-    "findstr",
-    "select-string",
+_UTF8_BOM: bytes = b"\xef\xbb\xbf"
+_ZIP_MAGICS: tuple[bytes, ...] = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+_OLE2_MAGIC: bytes = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+_OFFICE_AND_ODF_MIMES: Mapping[str, str] = {
+    ".doc": "application/msword",
+    ".docx": (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ),
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    ),
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pptx": (
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    ),
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+    ".odp": "application/vnd.oasis.opendocument.presentation",
 }
 
-FILE_READ_TOOLS: Set[str] = {
-    "read_file",
-    "view_file",
-    "view_file_outline",
-    "view_code_item",
+_EXTENSION_MULTIMODAL_MIMES: Mapping[str, str] = {
+    **_OFFICE_AND_ODF_MIMES,
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".ico": "image/x-icon",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".heic": "image/heic",
+    ".heif": "image/heif",
+    ".avif": "image/avif",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".opus": "audio/opus",
+    ".spx": "audio/ogg",
+    ".flac": "audio/flac",
+    ".aac": "audio/aac",
+    ".m4a": "audio/mp4",
+    ".aiff": "audio/aiff",
+    ".aif": "audio/aiff",
+    ".wma": "audio/x-ms-wma",
+    ".mid": "audio/midi",
+    ".midi": "audio/midi",
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+    ".avi": "video/avi",
+    ".ogv": "video/ogg",
+    ".flv": "video/x-flv",
+    ".wmv": "video/x-ms-wmv",
+    ".3gp": "video/3gpp",
+    ".mpeg": "video/mpeg",
+    ".mpg": "video/mpeg",
 }
 
-SHELL_READ_COMMANDS: Set[str] = {
-    "cat",
-    "head",
-    "tail",
-    "less",
-    "more",
-    "bat",
-    "nl",
-    "get-content",
-    "gc",
-    "type",
-    "awk",
-    "gawk",
-    "mawk",
-    "sed",
-    "jq",
-    "yq",
-    "rg",
-    "grep",
-    "egrep",
-    "fgrep",
-    "findstr",
-    "select-string",
-    "strings",
-    "base64",
-    "xxd",
-    "hexdump",
-    "od",
-    "sort",
-    "uniq",
-    "cut",
-    "wc",
-    "diff",
-    "comm",
-    "paste",
-    "join",
-    "curl",
-    "wget",
-    "python",
-    "python3",
-    "py",
-    "node",
-    "perl",
-    "ruby",
-    "sh",
-    "bash",
-    "zsh",
-    "pwsh",
-    "powershell",
-}
-
-INLINE_TEXT_KEYS: Tuple[str, ...] = (
-    "CommandLine",
-    "CodeContent",
-    "Content",
-    "TargetContent",
-    "ReplacementContent",
-    "Target",
-    "Replacement",
-    "Query",
-    "Message",
-    "Prompt",
+_UNSCANNABLE_OUTPUT_MIMES: frozenset[str] = frozenset(
+    set(_OFFICE_AND_ODF_MIMES.values()) | {"application/pdf"}
 )
 
-_TRANSCRIPT_FILE_RE = re.compile(
-    r"@\[[^\]]+\]\s+is\s+a\s+\[File\]:\s*\r?\n([^\r\n<]+)"
-)
-_TRANSCRIPT_CODE_ITEM_RE = re.compile(
-    r"@\[[^\]]+\]\s+is\s+a\s+\[Code Item\]:\s*\r?\n(\{[^\r\n]+\})"
-)
-_AT_MENTION_RE = re.compile(
-    r'(?:^|[\s(\[{"\'])@(?:(?:"([^"]+)")|(?:\'([^\']+)\')|(?:\[([^\]]+)\])|([^\s)\]}",;<>]+))'
-)
-_PATH_TOKEN_RE = re.compile(
-    r'(?:"([^"\r\n]+)"|\'([^\'\r\n]+)\'|([^\s"\'`()\[\]{}<>,;]+))'
-)
-_FILE_EXTENSION_RE = re.compile(r"\.[A-Za-z0-9]{1,10}$")
-_PROSE_ABBREV_RE = re.compile(
-    r"^(?:v?\d+(?:\.\d+)+|e\.g|i\.e|etc|vs|cf|viz|fig|sec|para|no|mr|mrs|ms|dr|prof|sr|jr|st|lt|col|gen|inc|ltd|co|corp|[A-Z0-9]{2,6}/[A-Z0-9]{2,6})$",
-    re.IGNORECASE,
-)
-_INLINE_FILE_LITERAL_RE = re.compile(
-    r"""(?:open|read_text|read_bytes|readFileSync|read_csv|read_json|read_excel|load)\s*\(\s*[rRbBuU]?['"]([^'"\r\n]+)['"]"""
-)
+_LINE_FRAGMENT_SUFFIX_RE = re.compile(r"#L\d+(?:-L?\d+)?$", re.IGNORECASE)
+_POSIX_WINDOWS_DRIVE_RE = re.compile(r"^/([A-Za-z]:/.*)$")
+
+_YAML_CONFIG_CACHE: dict[tuple[str, int], dict[str, dict[str, str]]] = {}
 
 
 def _parse_bool(raw_val: Any, default: bool) -> bool:
-    """Parses a boolean from YAML or environment string representations."""
+    """Parses a boolean from YAML or Python primitives."""
     if isinstance(raw_val, bool):
         return raw_val
     if isinstance(raw_val, str):
@@ -188,15 +156,39 @@ def _parse_bool(raw_val: Any, default: bool) -> bool:
     return default
 
 
-def _parse_yaml_section(yaml_text: str, section_name: str) -> Dict[str, str]:
-    """Extracts key-value pairs scoped strictly to a top-level YAML mapping block.
+def _parse_non_bool_int(raw_val: Any) -> int | None:
+    """Coerces an integer or numeric string while rejecting booleans."""
+    if raw_val is None or isinstance(raw_val, bool):
+        return None
+    if isinstance(raw_val, int):
+        return raw_val
+    if isinstance(raw_val, float):
+        return int(raw_val) if raw_val.is_integer() else None
+    if isinstance(raw_val, str):
+        stripped = raw_val.strip()
+        if stripped and (
+            stripped.isdigit()
+            or (stripped.startswith("-") and stripped[1:].isdigit())
+        ):
+            return int(stripped)
+    return None
 
-    Used when PyYAML is not installed in the runtime so `file_scanning.enabled`
-    never collides with `pii_guard.enabled` or `model_armor.enabled`.
+
+def _parse_yaml_section(yaml_text: str, section_name: str) -> dict[str, str]:
+    """Extracts key-value pairs scoped strictly to a top-level YAML block.
+
+    Args:
+        yaml_text: Raw UTF-8 contents of `config.yaml`.
+        section_name: Top-level YAML mapping name (e.g. `"hooks"`, `"payload"`).
+
+    Returns:
+        Flat string key-value dictionary parsed from that top-level section.
     """
-    result: Dict[str, str] = {}
+    result: dict[str, str] = {}
     in_section = False
-    section_indent: Optional[int] = None
+    section_indent: int | None = None
+    header_re = re.compile(rf"^{re.escape(section_name)}\s*:\s*(?:#.*)?$")
+    kv_re = re.compile(r"^([A-Za-z0-9_]+)\s*:\s*(.+?)\s*$")
 
     for raw_line in yaml_text.splitlines():
         stripped = raw_line.strip()
@@ -204,9 +196,7 @@ def _parse_yaml_section(yaml_text: str, section_name: str) -> Dict[str, str]:
             continue
         indent = len(raw_line) - len(raw_line.lstrip(" "))
         if not in_section:
-            if indent == 0 and re.match(
-                rf"^{re.escape(section_name)}\s*:\s*(?:#.*)?$", stripped
-            ):
+            if indent == 0 and header_re.match(stripped):
                 in_section = True
                 section_indent = None
             continue
@@ -218,12 +208,11 @@ def _parse_yaml_section(yaml_text: str, section_name: str) -> Dict[str, str]:
         if indent != section_indent:
             continue
 
-        kv_match = re.match(r"^([A-Za-z0-9_]+)\s*:\s*(.+?)\s*$", stripped)
+        kv_match = kv_re.match(stripped)
         if not kv_match:
             continue
         key = kv_match.group(1)
-        val_part = kv_match.group(2)
-        val_no_comment = re.sub(r"\s+#.*$", "", val_part).strip()
+        val_no_comment = re.sub(r"\s+#.*$", "", kv_match.group(2)).strip()
         if (
             len(val_no_comment) >= 2
             and val_no_comment[0] == val_no_comment[-1]
@@ -234,1337 +223,904 @@ def _parse_yaml_section(yaml_text: str, section_name: str) -> Dict[str, str]:
     return result
 
 
-def _is_prose_non_path_token(token: str) -> bool:
-    """Returns True if token is a prose abbreviation, version number, or slash acronym."""
-    if not token or len(token) < 3:
-        return True
-    if _PROSE_ABBREV_RE.match(token):
-        return True
-    if "/" in token and not token.startswith(("/", "./", "../", "~/")):
-        parts = token.split("/")
-        if len(parts) == 2 and all(
-            (part.isupper() and len(part) <= 6) or part.isdigit()
-            for part in parts
-            if part
-        ):
-            return True
-    return False
+def decode_file_uri(raw_path: str) -> str:
+    """Decodes a `file://` URI into a local filesystem path, or returns `raw_path`.
+
+    Uses `urllib.parse.urlparse` + `urllib.request.url2pathname` so percent
+    escapes (`%20`, `%23`), URI `#fragment` suffixes, Windows drive URIs
+    (`file:///C:/...`), and UNC hosts (`file://server/share/...`) decode cleanly
+    without corrupting literal `#` characters in plain filesystem paths.
+
+    Args:
+        raw_path: Raw path or `file://` URI string.
+
+    Returns:
+        Decoded filesystem path string.
+    """
+    cleaned = raw_path.strip()
+    if (
+        len(cleaned) >= 2
+        and cleaned[0] == cleaned[-1]
+        and cleaned[0] in {"'", '"'}
+    ):
+        cleaned = cleaned[1:-1].strip()
+
+    if not cleaned.lower().startswith("file:"):
+        return cleaned
+
+    parsed = urllib.parse.urlparse(cleaned)
+    netloc = parsed.netloc
+    if netloc and netloc.lower() != "localhost":
+        url_path = f"//{netloc}{parsed.path}"
+    else:
+        url_path = parsed.path
+
+    decoded = urllib.request.url2pathname(url_path)
+    if os.name != "nt":
+        win_match = _POSIX_WINDOWS_DRIVE_RE.match(decoded)
+        if win_match:
+            return win_match.group(1)
+    return decoded
 
 
-def _split_shell_segments(cmd_line: str) -> List[str]:
-    """Splits a shell command string on unquoted |, ||, &&, ;, and newline tokens."""
-    segments: List[str] = []
-    buf: List[str] = []
-    in_single = False
-    in_double = False
-    escaped = False
-    idx = 0
-    length = len(cmd_line)
+def detect_multimodal_mime(file_path: str, head_bytes: bytes) -> str | None:
+    """Detects multimodal binary MIME type from 512-byte header magic or extension.
 
-    while idx < length:
-        ch = cmd_line[idx]
-        if escaped:
-            buf.append(ch)
-            escaped = False
-            idx += 1
-            continue
-        if ch == "\\" and not in_single:
-            escaped = True
-            buf.append(ch)
-            idx += 1
-            continue
-        if ch == "'" and not in_double:
-            in_single = not in_single
-            buf.append(ch)
-            idx += 1
-            continue
-        if ch == '"' and not in_single:
-            in_double = not in_double
-            buf.append(ch)
-            idx += 1
-            continue
-        if not in_single and not in_double:
-            if cmd_line[idx : idx + 2] in ("&&", "||"):
-                seg = "".join(buf).strip()
-                if seg:
-                    segments.append(seg)
-                buf = []
-                idx += 2
-                continue
-            if ch in "|;\n":
-                seg = "".join(buf).strip()
-                if seg:
-                    segments.append(seg)
-                buf = []
-                idx += 1
-                continue
-        buf.append(ch)
-        idx += 1
+    Mirrors Antigravity's `mediautil.DetectMimeType` + `detectViewFileMimeType`.
+    Note that callers MUST combine this with binaryness validation (`%PDF-`, NUL
+    byte, or invalid UTF-8) before classifying a file as binary media so valid
+    UTF-8 text files starting with `"BM..."`, `"GIF89a..."`, `"ID3..."`, or
+    ending in `.svg` are scanned as text rather than blocked.
 
-    tail_seg = "".join(buf).strip()
-    if tail_seg:
-        segments.append(tail_seg)
-    return segments
+    Args:
+        file_path: Resolved path of the file (used for extension disambiguation).
+        head_bytes: Up to 512 initial bytes after stripping any UTF-8 BOM.
 
-
-def _decode_raw_bytes(
-    raw_bytes: bytes, sniff_window: bytes
-) -> Optional[str]:
-    """Decodes raw file bytes as UTF-16 (if BOM present) or UTF-8, skipping binary files."""
-    if sniff_window.startswith(b"\xff\xfe"):
-        body = raw_bytes[2:] if raw_bytes.startswith(b"\xff\xfe") else raw_bytes
-        return body.decode("utf-16-le", errors="replace")
-    if sniff_window.startswith(b"\xfe\xff"):
-        body = raw_bytes[2:] if raw_bytes.startswith(b"\xfe\xff") else raw_bytes
-        return body.decode("utf-16-be", errors="replace")
-    if b"\x00" in sniff_window:
+    Returns:
+        Canonical multimodal MIME string if recognized, or None for non-media
+        types (such as `.svg`, plain `.zip`, executables, or source files).
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".svg":
         return None
-    if raw_bytes.startswith(b"\xef\xbb\xbf"):
-        raw_bytes = raw_bytes[3:]
-    return raw_bytes.decode("utf-8", errors="replace")
+    if head_bytes.startswith((b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff")):
+        return None
+
+    if head_bytes.startswith(b"%PDF-"):
+        return "application/pdf"
+    if head_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head_bytes.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(head_bytes) >= 12 and head_bytes[:4] == b"RIFF":
+        fourcc = head_bytes[8:12]
+        if fourcc == b"WEBP":
+            return "image/webp"
+        if fourcc == b"WAVE":
+            return "audio/wav"
+        if fourcc == b"AVI ":
+            return "video/avi"
+    if (
+        len(head_bytes) >= 12
+        and head_bytes[:4] == b"FORM"
+        and head_bytes[8:12] in (b"AIFF", b"AIFC")
+    ):
+        return "audio/aiff"
+    if head_bytes.startswith(b"BM"):
+        return "image/bmp"
+    if head_bytes.startswith((b"\x00\x00\x01\x00", b"\x00\x00\x02\x00")):
+        return "image/x-icon"
+    if head_bytes.startswith((b"II*\x00", b"MM\x00*")):
+        return "image/tiff"
+    if len(head_bytes) >= 12 and head_bytes[4:8] == b"ftyp":
+        brand = head_bytes[8:12]
+        if brand in (b"avif", b"avis"):
+            return "image/avif"
+        if brand in (b"heic", b"heix", b"mif1", b"msf1"):
+            return "image/heic"
+        if brand in (b"M4A ", b"M4B "):
+            return "audio/mp4"
+        return "video/mp4"
+    if head_bytes.startswith(b"OggS"):
+        return "video/ogg" if ext == ".ogv" else "audio/ogg"
+    if head_bytes.startswith(b"fLaC"):
+        return "audio/flac"
+    if head_bytes.startswith(b"MThd"):
+        return "audio/midi"
+    if head_bytes.startswith(b"ID3") or (
+        len(head_bytes) >= 2
+        and head_bytes[0] == 0xFF
+        and (head_bytes[1] & 0xE0) == 0xE0
+    ):
+        return "audio/mpeg"
+    if head_bytes.startswith(b"\x1a\x45\xdf\xa3"):
+        return "video/webm"
+    if head_bytes.startswith(b"FLV\x01"):
+        return "video/x-flv"
+
+    if head_bytes.startswith(_ZIP_MAGICS) or head_bytes.startswith(_OLE2_MAGIC):
+        return _OFFICE_AND_ODF_MIMES.get(ext)
+
+    return _EXTENSION_MULTIMODAL_MIMES.get(ext)
 
 
-_YAML_SECTION_CACHE: Dict[Tuple[str, int], Dict[str, Any]] = {}
+def is_unscannable_multimodal_mime(mime_type: str | None) -> bool:
+    """Returns True if `mime_type` is a non-text multimodal binary media type."""
+    if not mime_type:
+        return False
+    normalized = mime_type.split(";", 1)[0].strip().lower()
+    if not normalized or normalized == "image/svg+xml" or normalized.startswith("text/"):
+        return False
+    if normalized.startswith(("image/", "audio/", "video/")):
+        return True
+    return normalized in _UNSCANNABLE_OUTPUT_MIMES
+
+
+def _split_incomplete_utf8_tail(buf: bytes) -> tuple[bytes, bytes]:
+    """Splits a byte chunk at its last complete UTF-8 sequence boundary.
+
+    Called only when more bytes remain in the file (`not at_eof`) so a 64 KiB
+    read boundary landing inside a 2-, 3-, or 4-byte UTF-8 rune carries the
+    1-3 trailing bytes into the next read without raising a false decode error.
+
+    Args:
+        buf: Raw bytes read from the stream prior to EOF.
+
+    Returns:
+        Tuple `(complete_prefix, trailing_carry)` where `len(trailing_carry) <= 3`.
+    """
+    length = len(buf)
+    # Inspect up to the last 3 bytes for an unfinished multi-byte lead byte.
+    max_back = min(3, length)
+    for back in range(1, max_back + 1):
+        byte_val = buf[length - back]
+        if byte_val < 0x80:
+            return buf, b""
+        if (byte_val & 0xC0) == 0x80:
+            continue
+        # Found a lead byte at index `length - back`.
+        if (byte_val & 0xE0) == 0xC0:
+            expected_len = 2
+        elif (byte_val & 0xF0) == 0xE0:
+            expected_len = 3
+        elif (byte_val & 0xF8) == 0xF0:
+            expected_len = 4
+        else:
+            # Invalid UTF-8 lead byte (>= 0xF8); keep in complete_prefix so strict
+            # UTF-8 validation rejects it immediately.
+            return buf, b""
+        if back < expected_len:
+            cut = length - back
+            return buf[:cut], buf[cut:]
+        return buf, b""
+    return buf, b""
+
+
+def _trim_slice_utf8_boundaries(
+    raw_slice: bytes, excluded_next_byte: int | None
+) -> bytes:
+    """Trims split UTF-8 continuation bytes at `b_start` and `b_end`.
+
+    At `b_start`, advances past leading continuation bytes (`0x80..0xBF`).
+    At `b_end`, inspects `excluded_next_byte` (`buf[b_end]`): if it is a
+    continuation byte (`0x80..0xBF`), backs up across any trailing continuation
+    bytes and the split lead byte, preserving complete trailing multi-byte runes.
+
+    Args:
+        raw_slice: Candidate raw UTF-8 slice `[b_start:b_end]`.
+        excluded_next_byte: First excluded byte `buf[b_end]` from the same line
+            when truncated by `win_end`, or None if `b_end` reached line/file end.
+
+    Returns:
+        Rune-aligned UTF-8 byte slice.
+    """
+    if not raw_slice:
+        return b""
+
+    end_idx = len(raw_slice)
+    next_byte = excluded_next_byte
+    while end_idx > 0 and next_byte is not None and (next_byte & 0xC0) == 0x80:
+        end_idx -= 1
+        next_byte = raw_slice[end_idx]
+
+    start_idx = 0
+    while start_idx < end_idx and (raw_slice[start_idx] & 0xC0) == 0x80:
+        start_idx += 1
+
+    return raw_slice[start_idx:end_idx]
+
+
+class _BoundedByteWindow:
+    """Collects raw bytes overlapping `[win_start, win_end)` plus 1 lookahead byte."""
+
+    def __init__(self, win_start: int, win_end: int) -> None:
+        """Initializes the instance.
+
+        Args:
+            win_start: Inclusive start offset (formatted or raw).
+            win_end: Exclusive end offset (formatted or raw).
+        """
+        self._win_start = max(0, win_start)
+        self._win_end = max(self._win_start, win_end)
+        self._pos = 0
+        self._parts: list[bytes] = []
+        self._excluded_next_byte: int | None = None
+
+    def advance_virtual(self, count: int) -> None:
+        """Advances coordinate position for virtual prefixes (`"%d: "`)."""
+        self._pos += count
+
+    def append_segment(self, segment: bytes) -> None:
+        """Appends any overlap of `segment` with `[win_start, win_end)`."""
+        seg_len = len(segment)
+        seg_start = self._pos
+        seg_end = seg_start + seg_len
+        self._pos = seg_end
+
+        if seg_end <= self._win_start or seg_start > self._win_end:
+            return
+
+        if seg_start < self._win_end:
+            clip_start = max(0, self._win_start - seg_start)
+            clip_end = min(seg_len, self._win_end - seg_start)
+            self._parts.append(segment[clip_start:clip_end])
+
+        if seg_start <= self._win_end < seg_end:
+            self._excluded_next_byte = segment[self._win_end - seg_start]
+
+    def decode_utf8(self) -> str:
+        """Aligns UTF-8 boundaries and decodes the retained slice."""
+        joined = b"".join(self._parts)
+        aligned = _trim_slice_utf8_boundaries(joined, self._excluded_next_byte)
+        return aligned.decode("utf-8")
+
+
+def _flatten_notebook_source(raw_source: Any) -> str:
+    """Flattens an `.ipynb` cell `source` field (`str` or `list[str]`)."""
+    if isinstance(raw_source, str):
+        return raw_source
+    if isinstance(raw_source, list):
+        return "".join(part for part in raw_source if isinstance(part, str))
+    return ""
+
+
+def _has_non_empty_output_payload(payload_val: Any) -> bool:
+    """Returns True if an `.ipynb` `outputs[].data[mime]` entry has content."""
+    if isinstance(payload_val, str):
+        return bool(payload_val.strip())
+    if isinstance(payload_val, list):
+        return any(
+            isinstance(item, str) and bool(item.strip()) for item in payload_val
+        )
+    if isinstance(payload_val, Mapping):
+        return bool(payload_val)
+    return payload_val is not None
 
 
 @dataclasses.dataclass(frozen=True)
 class FileScanConfig:
-    """Customer-configurable file scanning policy resolved from config.yaml and env vars."""
+    """v2-compatible pre-read scan and unscannable-media configuration.
 
-    enabled: bool = True
-    mode: str = "prompt_only"
-    max_file_size_bytes: int = DEFAULT_MAX_UNPAGED_FILE_BYTES
-    oversize_action: str = "TRUNCATE"
-    unpaged_scan_mode: str = "single"
-    state_ttl_seconds: int = DEFAULT_STATE_TTL_SECONDS
+    Attributes:
+        pre_read_scan: Whether `PreToolUse` pre-reads `read_file`, `view_file`,
+            and `notebook_edit` slices (`hooks.pre_read_scan` in `config.yaml`).
+        on_unscannable_media: Policy (`"BLOCK"` or `"ALLOW"`) applied to binary
+            multimodal media (`payload.on_unscannable_media` in `config.yaml`).
+    """
 
-    @property
-    def effective_mode(self) -> str:
-        """Returns the active scan mode, or 'disabled' when enabled is False."""
-        return self.mode if self.enabled else "disabled"
+    pre_read_scan: bool = True
+    on_unscannable_media: str = "BLOCK"
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Serializes the active file scanning configuration for CLI and JSON output."""
+    def __post_init__(self) -> None:
+        coerced_scan = _parse_bool(self.pre_read_scan, True)
+        object.__setattr__(self, "pre_read_scan", coerced_scan)
+        raw_media = str(self.on_unscannable_media or "BLOCK").strip().upper()
+        if raw_media not in VALID_UNSCANNABLE_MEDIA_ACTIONS:
+            raw_media = "BLOCK"
+        object.__setattr__(self, "on_unscannable_media", raw_media)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serializes configuration fields to a dictionary."""
         return {
-            "enabled": self.enabled,
-            "mode": self.mode,
-            "effective_mode": self.effective_mode,
-            "max_file_size_bytes": self.max_file_size_bytes,
-            "oversize_action": self.oversize_action,
-            "unpaged_scan_mode": self.unpaged_scan_mode,
-            "state_ttl_seconds": self.state_ttl_seconds,
+            "pre_read_scan": self.pre_read_scan,
+            "on_unscannable_media": self.on_unscannable_media,
         }
 
     @classmethod
     def from_config(
         cls,
-        config_path: Optional[str] = None,
-        env: Optional[Mapping[str, str]] = None,
-        force_stdlib_parser: bool = False,
-    ) -> "FileScanConfig":
-        """Loads FileScanConfig with precedence: env vars > config.yaml > defaults."""
-        del force_stdlib_parser  # Unused; _parse_yaml_section is always fast and zero-dep.
-        env_map: Mapping[str, str] = env if env is not None else os.environ
-        if not config_path:
+        config_source: str | os.PathLike[str] | Mapping[str, Any] | None = None,
+    ) -> FileScanConfig:
+        """Loads `FileScanConfig` from a mapping or `config.yaml` file path.
+
+        Args:
+            config_source: Optional parsed config mapping (`{"hooks": ...,
+                "payload": ...}`), path to `config.yaml`, or None to load the
+                default `AGY-Plugin/config/config.yaml`.
+
+        Returns:
+            Validated `FileScanConfig` instance.
+        """
+        if isinstance(config_source, Mapping):
+            hooks_sec = config_source.get("hooks")
+            payload_sec = config_source.get("payload")
+            raw_pre = (
+                hooks_sec.get("pre_read_scan")
+                if isinstance(hooks_sec, Mapping)
+                else config_source.get("pre_read_scan", True)
+            )
+            raw_media = (
+                payload_sec.get("on_unscannable_media")
+                if isinstance(payload_sec, Mapping)
+                else config_source.get("on_unscannable_media", "BLOCK")
+            )
+            return cls(
+                pre_read_scan=_parse_bool(raw_pre, True),
+                on_unscannable_media=(
+                    str(raw_media) if raw_media is not None else "BLOCK"
+                ),
+            )
+
+        if config_source is None or config_source == "":
             plugin_root = os.path.dirname(
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             )
-            config_path = os.path.join(plugin_root, "config", "config.yaml")
+            resolved_path = os.path.join(plugin_root, "config", "config.yaml")
+        else:
+            resolved_path = os.fspath(config_source)
 
-        raw_sec: Dict[str, Any] = {}
-        if config_path:
-            try:
-                st = os.stat(config_path)
-                cache_key = (os.path.abspath(config_path), st.st_mtime_ns)
-                cached = _YAML_SECTION_CACHE.get(cache_key)
-                if cached is not None:
-                    raw_sec = cached
-                else:
-                    with open(config_path, "r", encoding="utf-8") as cfg_file:
-                        yaml_text = cfg_file.read()
-                    raw_sec = _parse_yaml_section(yaml_text, "file_scanning")
-                    _YAML_SECTION_CACHE[cache_key] = raw_sec
-            except OSError:
-                pass
-
-        enabled = _parse_bool(raw_sec.get("enabled"), True)
-        if env_map.get("NANDI_FILE_SCAN_ENABLED", "").strip():
-            enabled = _parse_bool(env_map["NANDI_FILE_SCAN_ENABLED"], enabled)
-
-        mode = str(raw_sec.get("mode", "prompt_only")).strip().lower()
-        if env_map.get("NANDI_FILE_SCAN_MODE", "").strip():
-            mode = env_map["NANDI_FILE_SCAN_MODE"].strip().lower()
-        if mode not in VALID_SCAN_MODES:
-            mode = "prompt_only"
-
+        sections: dict[str, dict[str, str]] = {"hooks": {}, "payload": {}}
         try:
-            max_bytes = int(
-                env_map.get("NANDI_FILE_SCAN_MAX_BYTES", "").strip()
-                or env_map.get("NANDI_MAX_FILE_SIZE_BYTES", "").strip()
-                or raw_sec.get("max_file_size_bytes", DEFAULT_MAX_UNPAGED_FILE_BYTES)
-            )
-        except (TypeError, ValueError):
-            max_bytes = DEFAULT_MAX_UNPAGED_FILE_BYTES
-        max_bytes = max(
-            MIN_CONFIGURABLE_UNPAGED_BYTES,
-            min(max_bytes, MAX_CONFIGURABLE_UNPAGED_BYTES),
-        )
+            st = os.stat(resolved_path)
+            cache_key = (os.path.abspath(resolved_path), st.st_mtime_ns)
+            cached = _YAML_CONFIG_CACHE.get(cache_key)
+            if cached is not None:
+                sections = cached
+            else:
+                with open(resolved_path, "r", encoding="utf-8") as cfg_file:
+                    yaml_text = cfg_file.read()
+                sections = {
+                    "hooks": _parse_yaml_section(yaml_text, "hooks"),
+                    "payload": _parse_yaml_section(yaml_text, "payload"),
+                }
+                _YAML_CONFIG_CACHE[cache_key] = sections
+        except OSError:
+            # Missing or unreadable config.yaml falls back to fail-closed defaults.
+            pass
 
-        oversize = str(
-            env_map.get("NANDI_FILE_SCAN_OVERSIZE_ACTION", "").strip()
-            or env_map.get("NANDI_OVERSIZE_FILE_ACTION", "").strip()
-            or raw_sec.get("oversize_action", "TRUNCATE")
-        ).strip().upper()
-        if oversize not in VALID_OVERSIZE_ACTIONS:
-            oversize = "TRUNCATE"
-
-        unpaged_mode = str(
-            env_map.get("NANDI_FILE_SCAN_UNPAGED_MODE", "").strip()
-            or raw_sec.get("unpaged_scan_mode", "single")
-        ).strip().lower()
-        if unpaged_mode not in VALID_UNPAGED_SCAN_MODES:
-            unpaged_mode = "single"
-
-        try:
-            state_ttl = int(
-                env_map.get("NANDI_STATE_TTL_SECONDS", "").strip()
-                or env_map.get("NANDI_FILE_SCAN_STATE_TTL_SECONDS", "").strip()
-                or raw_sec.get("state_ttl_seconds", DEFAULT_STATE_TTL_SECONDS)
-            )
-        except (TypeError, ValueError):
-            state_ttl = DEFAULT_STATE_TTL_SECONDS
-        state_ttl = max(
-            MIN_STATE_TTL_SECONDS,
-            min(state_ttl, MAX_STATE_TTL_SECONDS),
-        )
-
+        pre_read = _parse_bool(sections["hooks"].get("pre_read_scan"), True)
+        media_policy = sections["payload"].get("on_unscannable_media", "BLOCK")
         return cls(
-            enabled=enabled,
-            mode=mode,
-            max_file_size_bytes=max_bytes,
-            oversize_action=oversize,
-            unpaged_scan_mode=unpaged_mode,
-            state_ttl_seconds=state_ttl,
+            pre_read_scan=pre_read,
+            on_unscannable_media=media_policy,
         )
 
 
 @dataclasses.dataclass(frozen=True)
-class CachedSliceRecord:
-    """Represents a file slice that passed security inspection in the active turn."""
+class PagedSliceResult:
+    """Outcome of reading a bounded paged file view or notebook cell view.
 
-    real_path: str
-    mtime_ns: int
-    size: int
-    start_line: int
-    end_line: int
-    byte_start: int
-    byte_end: int
+    Attributes:
+        status: `"SCAN"`, `"BLOCK_MEDIA"`, `"BLOCK_OVERSIZE"`, or `"SKIP"`.
+        content: Extracted UTF-8 slice text when `status == "SCAN"`.
+        reason: Policy denial message when `status` starts with `"BLOCK_"`.
+    """
 
-    def covers(
-        self,
-        real_path: str,
-        mtime_ns: int,
-        size: int,
-        start_line: int,
-        end_line: int,
-        byte_start: int,
-        byte_end: int,
-    ) -> bool:
-        """Returns True if this cached record covers the requested slice on an unchanged file."""
-        return (
-            self.real_path == real_path
-            and self.mtime_ns == mtime_ns
-            and self.size == size
-            and self.start_line <= start_line
-            and self.end_line >= end_line
-            and self.byte_start <= byte_start
-            and self.byte_end >= byte_end
-        )
-
-    def to_list(self) -> List[Any]:
-        """Serializes record into a compact JSON-compatible list."""
-        return [
-            self.real_path,
-            self.mtime_ns,
-            self.size,
-            self.start_line,
-            self.end_line,
-            self.byte_start,
-            self.byte_end,
-        ]
-
-    @classmethod
-    def from_list(cls, data: Sequence[Any]) -> Optional["CachedSliceRecord"]:
-        """Deserializes a CachedSliceRecord from a JSON list."""
-        if not isinstance(data, (list, tuple)) or len(data) != 7:
-            return None
-        try:
-            return cls(
-                real_path=str(data[0]),
-                mtime_ns=int(data[1]),
-                size=int(data[2]),
-                start_line=int(data[3]),
-                end_line=int(data[4]),
-                byte_start=int(data[5]),
-                byte_end=int(data[6]),
-            )
-        except (TypeError, ValueError):
-            return None
+    status: str
+    content: str = ""
+    reason: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
 class ToolScanRequest:
-    """Value object encapsulating a PreToolUse inspection request."""
+    """Input envelope for `FileScanner.extract_tool_scan_target`.
+
+    Attributes:
+        tool_name: Name of the Antigravity tool in `PreToolUse`.
+        tool_args: Tool call arguments dictionary.
+        workspace_paths: Active workspace root directories from hook payload.
+    """
 
     tool_name: str
-    tool_args: Dict[str, Any]
-    workspace_paths: List[str]
-    prompt_files: Set[str]
-    cached_slices: Sequence[CachedSliceRecord] = ()
+    tool_args: Mapping[str, Any]
+    workspace_paths: Sequence[str] = ()
 
 
 @dataclasses.dataclass(frozen=True)
 class ScanExtractionResult:
-    """Outcome of extracting actionable text or file slices for hook inspection."""
+    """Actionable scan payload produced for `PreInvocation` or `PreToolUse`.
 
-    action: str  # "SCAN" | "SKIP_CACHED" | "NO_ACTIONABLE_TEXT" | "BLOCK_POLICY"
+    Attributes:
+        action: `"SCAN"`, `"SKIP_CACHED"`, `"NO_ACTIONABLE_TEXT"`, or
+            `"BLOCK_POLICY"`.
+        text_to_scan: Full text payload to inspect when `action == "SCAN"`.
+        source: Diagnostic source tag recorded in audit metadata.
+        block_reason: Policy refusal reason when `action == "BLOCK_POLICY"`.
+        slice_text: Extracted file or notebook view text alone (for partial
+            cache lookup when only `args_text` varies).
+        args_text: Extracted `_collect_nested_strings(tool_args)` text.
+    """
+
+    action: str
     text_to_scan: str = ""
-    source: str = "empty"
+    source: str = ""
     block_reason: str = ""
-    scanned_slices: Tuple[CachedSliceRecord, ...] = ()
-    prompt_files: Tuple[str, ...] = ()
+    slice_text: str = ""
+    args_text: str = ""
 
 
 class FileScanner:
-    """Streams bounded file slices and evaluates Git workspace trust for hook inspection."""
+    """Extracts paged text slices, `.ipynb` cells, and multimodal media verdicts."""
 
-    def __init__(
-        self,
-        config: Optional[FileScanConfig] = None,
-        plugin_root: Optional[str] = None,
-    ) -> None:
-        self.plugin_root = plugin_root or os.path.dirname(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    def __init__(self, config: FileScanConfig | None = None) -> None:
+        """Initializes the instance.
+
+        Args:
+            config: Optional explicit `FileScanConfig`; loads `config.yaml` when
+                None.
+        """
+        self.config: FileScanConfig = (
+            config if config is not None else FileScanConfig.from_config()
         )
-        self.config = config or FileScanConfig.from_config(
-            os.path.join(self.plugin_root, "config", "config.yaml")
-        )
-        self._git_repo_cache: Dict[str, Optional[str]] = {}
-
-    def resolve_candidate_path(
-        self,
-        raw_path: str,
-        workspace_paths: Sequence[str] = (),
-        cwd: Optional[str] = None,
-    ) -> Optional[str]:
-        """Resolves a candidate file path against workspacePaths or cwd if it is a regular file."""
-        if not raw_path or not isinstance(raw_path, str):
-            return None
-        cleaned = raw_path.strip().strip("\"'`[]()")
-        if cleaned.startswith("file://"):
-            cleaned = cleaned[len("file://") :]
-        cleaned = re.sub(
-            r"(?:#L?\d+(?:-L?\d+)?|:L?\d+(?:[-:]L?\d+)?)$", "", cleaned
-        )
-        if not cleaned:
-            return None
-
-        variants = [cleaned]
-        stripped_punct = cleaned.rstrip(".,;:!?")
-        if stripped_punct and stripped_punct != cleaned:
-            variants.append(stripped_punct)
-
-        valid_ws = [
-            ws_dir.strip()
-            for ws_dir in workspace_paths
-            if isinstance(ws_dir, str) and ws_dir.strip()
-        ]
-        fallback_dirs: List[str] = []
-        if cwd and isinstance(cwd, str) and cwd.strip():
-            fallback_dirs.append(cwd.strip())
-        elif not valid_ws:
-            fallback_dirs.append(os.getcwd())
-        env_pwd = os.environ.get("PWD", "").strip()
-        if env_pwd and os.path.isdir(env_pwd) and env_pwd not in fallback_dirs:
-            fallback_dirs.append(env_pwd)
-
-        for variant in variants:
-            expanded = os.path.expanduser(variant)
-            candidates: List[str] = []
-            if os.path.isabs(expanded):
-                candidates.append(expanded)
-            else:
-                for ws_dir in valid_ws:
-                    candidates.append(os.path.join(ws_dir, expanded))
-                for fb_dir in fallback_dirs:
-                    candidates.append(os.path.abspath(os.path.join(fb_dir, expanded)))
-
-            for candidate_path in candidates:
-                try:
-                    stat_result = os.stat(candidate_path)
-                    if stat.S_ISREG(stat_result.st_mode):
-                        return os.path.abspath(candidate_path)
-                except OSError:
-                    continue
-        return None
 
     @staticmethod
-    def split_utf8_chunks(
+    def split_char_chunks(
         text: str,
-        chunk_bytes: int = MAX_SCAN_BYTES_PER_VIEW,
-        overlap_bytes: int = BYTE_OFFSET_OVERLAP_BYTES,
-    ) -> List[str]:
-        """Splits text into UTF-8 byte-bounded chunks with boundary overlap."""
+        chunk_chars: int = MULTI_CHUNK_MAX_CHARS,
+        overlap_chars: int = MULTI_CHUNK_OVERLAP_CHARS,
+    ) -> list[str]:
+        """Splits `text` into overlapping character windows (`40,000` / `4,096`).
+
+        Args:
+            text: Full string to partition.
+            chunk_chars: Maximum characters per chunk (`> 0`).
+            overlap_chars: Characters repeated between consecutive chunks.
+
+        Returns:
+            Ordered list of overlapping character chunks (`[]` if `text` is empty).
+        """
         if not text:
             return []
-        raw = text.encode("utf-8")
-        if len(raw) <= chunk_bytes:
+        eff_chunk = max(1, chunk_chars)
+        eff_overlap = max(0, min(overlap_chars, eff_chunk - 1))
+        if len(text) <= eff_chunk:
             return [text]
-        chunks: List[str] = []
-        start = 0
-        total = len(raw)
-        safe_overlap = max(0, overlap_bytes)
-        while start < total:
-            end = min(total, start + chunk_bytes)
-            if end < total:
-                while end > start and (raw[end] & 0xC0) == 0x80:
-                    end -= 1
-            chunk_str = raw[start:end].decode("utf-8", errors="replace")
-            if chunk_str:
-                chunks.append(chunk_str)
-            if end >= total:
+
+        stride = eff_chunk - eff_overlap
+        chunks: list[str] = []
+        pos = 0
+        total_len = len(text)
+        while pos < total_len:
+            end = min(total_len, pos + eff_chunk)
+            chunks.append(text[pos:end])
+            if end >= total_len:
                 break
-            next_start = end - safe_overlap
-            while next_start < end and (raw[next_start] & 0xC0) == 0x80:
-                next_start += 1
-            if next_start <= start:
-                next_start = end
-            start = next_start
+            pos += stride
         return chunks
 
-    def resolve_candidate_directory(
-        self,
-        raw_path: str,
-        workspace_paths: Sequence[str] = (),
-        cwd: Optional[str] = None,
-    ) -> Optional[str]:
-        """Resolves a candidate directory path against workspacePaths or cwd if it is a directory."""
-        if not raw_path or not isinstance(raw_path, str):
+    def resolve_candidate_path(
+        self, candidate: str, workspace_paths: Sequence[str] = ()
+    ) -> str | None:
+        """Resolves a local path or `file://` URI to an existing regular file.
+
+        Args:
+            candidate: Raw path or `file://` URI from tool arguments or media.
+            workspace_paths: Ordered workspace directories for relative lookup.
+
+        Returns:
+            Canonical `realpath` to a regular file, or None if missing or
+            non-regular (directory, FIFO, socket, or device node).
+        """
+        if not candidate or not candidate.strip():
             return None
-        cleaned = raw_path.strip().strip("\"'`[]()")
-        if cleaned.startswith("file://"):
-            cleaned = cleaned[len("file://") :]
-        if not cleaned:
+
+        was_file_uri = candidate.strip().lower().startswith("file:")
+        decoded = os.path.expanduser(decode_file_uri(candidate))
+        if not decoded:
             return None
 
-        variants = [cleaned]
-        stripped_punct = cleaned.rstrip(".,;:!?")
-        if stripped_punct and stripped_punct != cleaned:
-            variants.append(stripped_punct)
+        candidates_to_try = [decoded]
+        if not was_file_uri and "#" in decoded:
+            stripped_frag = _LINE_FRAGMENT_SUFFIX_RE.sub("", decoded)
+            if stripped_frag and stripped_frag != decoded:
+                candidates_to_try.append(stripped_frag)
 
-        valid_ws = [
-            ws_dir.strip()
-            for ws_dir in workspace_paths
-            if isinstance(ws_dir, str) and ws_dir.strip()
-        ]
-        fallback_dirs: List[str] = []
-        if cwd and isinstance(cwd, str) and cwd.strip():
-            fallback_dirs.append(cwd.strip())
-        elif not valid_ws:
-            fallback_dirs.append(os.getcwd())
-        env_pwd = os.environ.get("PWD", "").strip()
-        if env_pwd and os.path.isdir(env_pwd) and env_pwd not in fallback_dirs:
-            fallback_dirs.append(env_pwd)
-
-        for variant in variants:
-            expanded = os.path.expanduser(variant)
-            candidates: List[str] = []
-            if os.path.isabs(expanded):
-                candidates.append(expanded)
-            else:
-                for ws_dir in valid_ws:
-                    candidates.append(os.path.join(ws_dir, expanded))
-                for fb_dir in fallback_dirs:
-                    candidates.append(os.path.abspath(os.path.join(fb_dir, expanded)))
-
-            for candidate_path in candidates:
+        search_roots = [w for w in workspace_paths if w] + [os.getcwd()]
+        for path_item in candidates_to_try:
+            probe_paths = (
+                [path_item]
+                if os.path.isabs(path_item)
+                else [os.path.join(root, path_item) for root in search_roots]
+            )
+            for probe in probe_paths:
                 try:
-                    stat_result = os.stat(candidate_path)
-                    if stat.S_ISDIR(stat_result.st_mode):
-                        return os.path.abspath(candidate_path)
+                    real_p = os.path.realpath(os.path.abspath(probe))
+                    st = os.stat(real_p)
+                    if stat.S_ISREG(st.st_mode):
+                        return real_p
                 except OSError:
                     continue
         return None
 
     @staticmethod
-    def _append_regular_file_under_dir(
-        cand_path: str,
-        real_dir: str,
-        seen_real: Set[str],
-        expanded: List[str],
-    ) -> None:
-        """Appends cand_path to expanded if it is an unseen regular file inside real_dir."""
-        if len(expanded) >= MAX_DIR_EXPANSION_FILES:
-            return
-        try:
-            st_cand = os.stat(cand_path)
-            if not stat.S_ISREG(st_cand.st_mode):
-                return
-            real_cand = os.path.realpath(cand_path)
-            if real_cand in seen_real:
-                return
-            if os.path.commonpath([real_cand, real_dir]) != real_dir:
-                return
-            seen_real.add(real_cand)
-            expanded.append(os.path.abspath(cand_path))
-        except (OSError, ValueError):
-            return
+    def _resolve_pagination_args(
+        tool_name: str, args: Mapping[str, Any]
+    ) -> tuple[int | None, int | None, int, bool]:
+        """Extracts `(start_line, end_line, byte_offset, offset_is_formatted)`.
 
-    @classmethod
-    def _walk_directory_bounded(
-        cls,
-        root_dir: str,
-        real_dir: str,
-        seen_real: Set[str],
-        expanded: List[str],
-    ) -> None:
-        """Walks root_dir deterministically up to MAX_DIR_EXPANSION_FILES regular files."""
-        for walk_root, dirnames, filenames in os.walk(root_dir):
-            dirnames[:] = [
-                d
-                for d in sorted(dirnames)
-                if d not in {".git", "__pycache__", "node_modules"}
-            ]
-            for fname in sorted(filenames):
-                if len(expanded) >= MAX_DIR_EXPANSION_FILES:
-                    return
-                cls._append_regular_file_under_dir(
-                    os.path.join(walk_root, fname),
-                    real_dir,
-                    seen_real,
-                    expanded,
-                )
-
-    def expand_directory_targets(
-        self,
-        dir_path: str,
-        workspace_paths: Sequence[str],
-        prompt_files: Set[str],
-    ) -> List[str]:
-        """Expands a directory target into prompt-referenced and untrusted regular files."""
-        if not self.config.enabled:
-            return []
-        try:
-            real_dir = os.path.realpath(os.path.abspath(dir_path))
-            if not os.path.isdir(real_dir):
-                return []
-        except OSError:
-            return []
-
-        expanded: List[str] = []
-        seen_real: Set[str] = set()
-
-        # 1. Always include prompt-referenced files residing under real_dir.
-        for pf in sorted(prompt_files):
-            resolved_pf = self.resolve_candidate_path(pf, workspace_paths)
-            if resolved_pf:
-                self._append_regular_file_under_dir(
-                    resolved_pf, real_dir, seen_real, expanded
-                )
-
-        if self.config.mode == "prompt_only":
-            return expanded
-
-        if self.config.mode == "all":
-            self._walk_directory_bounded(real_dir, real_dir, seen_real, expanded)
-            return expanded
-
-        # 2. In untrusted_and_prompt mode, enumerate dirty/untracked/ignored files via Git status
-        # when inside a Git workspace, or walk the directory when outside a Git workspace.
-        repo_root = (
-            self._find_git_repo_root(real_dir)
-            if self.is_within_workspace_paths(real_dir, workspace_paths)
-            else None
-        )
-        if not repo_root:
-            self._walk_directory_bounded(real_dir, real_dir, seen_real, expanded)
-            return expanded
-
-        rel_dir = os.path.relpath(real_dir, repo_root).replace(os.sep, "/")
-        git_cmd = [
-            "git",
-            "-C",
-            repo_root,
-            "status",
-            "--porcelain=v1",
-            "--ignored=matching",
-            "-z",
-            "--untracked-files=all",
-        ]
-        if rel_dir and rel_dir != ".":
-            git_cmd.extend(["--", rel_dir])
-        try:
-            proc = subprocess.run(
-                git_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                timeout=GIT_STATUS_TIMEOUT_SECONDS,
-                check=False,
-            )
-            if proc.returncode != 0:
-                self._walk_directory_bounded(real_dir, real_dir, seen_real, expanded)
-                return expanded
-
-            tokens = proc.stdout.decode("utf-8", errors="replace").split("\x00")
-            idx = 0
-            while idx < len(tokens):
-                entry = tokens[idx]
-                if len(entry) >= 4 and entry[2] == " ":
-                    xy = entry[:2]
-                    entry_path = entry[3:]
-                    abs_entry = os.path.join(repo_root, entry_path.rstrip("/"))
-                    if entry_path.endswith("/") or os.path.isdir(abs_entry):
-                        self._walk_directory_bounded(
-                            abs_entry, real_dir, seen_real, expanded
-                        )
-                    else:
-                        self._append_regular_file_under_dir(
-                            abs_entry, real_dir, seen_real, expanded
-                        )
-                    if xy[0] in {"R", "C"} or xy[1] in {"R", "C"}:
-                        idx += 1
-                idx += 1
-        except (OSError, subprocess.SubprocessError):
-            self._walk_directory_bounded(real_dir, real_dir, seen_real, expanded)
-
-        return expanded
-
-    @staticmethod
-    def is_within_workspace_paths(
-        resolved_path: str, workspace_paths: Sequence[str]
-    ) -> bool:
-        """Returns True if resolved_path resides inside one of workspace_paths."""
-        if not workspace_paths:
-            return False
-        normalized_target = os.path.realpath(os.path.abspath(resolved_path))
-        target_drive = os.path.splitdrive(normalized_target)[0].lower()
-        for workspace_dir in workspace_paths:
-            if not isinstance(workspace_dir, str) or not workspace_dir.strip():
-                continue
-            normalized_ws = os.path.realpath(os.path.abspath(workspace_dir.strip()))
-            if os.path.splitdrive(normalized_ws)[0].lower() != target_drive:
-                continue
-            try:
-                if (
-                    os.path.commonpath([normalized_target, normalized_ws])
-                    == normalized_ws
-                ):
-                    return True
-            except ValueError:
-                continue
-        return False
-
-    def _find_git_repo_root(self, dir_path: str) -> Optional[str]:
-        """Finds the enclosing Git repository root by walking parent directories."""
-        real_dir = os.path.realpath(os.path.abspath(dir_path))
-        if real_dir in self._git_repo_cache:
-            return self._git_repo_cache[real_dir]
-
-        cur = real_dir
-        visited: List[str] = []
-        found_root: Optional[str] = None
-        while True:
-            visited.append(cur)
-            if cur in self._git_repo_cache:
-                found_root = self._git_repo_cache[cur]
-                break
-            if os.path.exists(os.path.join(cur, ".git")):
-                found_root = cur
-                break
-            parent = os.path.dirname(cur)
-            if parent == cur:
-                break
-            cur = parent
-
-        for path_item in visited:
-            self._git_repo_cache[path_item] = found_root
-        return found_root
-
-    def batch_check_should_scan(
-        self,
-        resolved_paths: Sequence[str],
-        workspace_paths: Sequence[str],
-        prompt_files: Set[str],
-    ) -> Dict[str, bool]:
-        """Evaluates which files require scanning using 1 batched `git status` per repo.
-
-        A file is treated as trusted (skipping autonomous PreToolUse scan in
-        `untrusted_and_prompt` mode) if and only if:
-          1. It was NOT explicitly referenced in the user's prompt (`prompt_files`),
-          2. It resides inside `workspace_paths`, AND
-          3. `git status --porcelain=v1 --ignored=matching -z --untracked-files=normal`
-             exits with code 0 and reports neither the file nor any parent directory
-             prefix (meaning the file is tracked, clean in the working tree/index,
-             and not gitignored).
+        Reads nested `args["TextOptions"]` first (used by `view_file`) with
+        per-field fallback to top-level `StartLine`, `EndLine`, `ContentOffset`,
+        and `ByteOffset`.
         """
-        decisions: Dict[str, bool] = {}
-        if not resolved_paths:
-            return decisions
+        text_opts = args.get("TextOptions")
+        opts_map: Mapping[str, Any] = (
+            text_opts if isinstance(text_opts, Mapping) else {}
+        )
 
-        real_prompt_files = {
-            os.path.realpath(os.path.abspath(p)) for p in prompt_files if p
-        }
-        by_repo: Dict[str, List[Tuple[str, str]]] = {}
+        start_line = _parse_non_bool_int(opts_map.get("StartLine"))
+        if start_line is None:
+            start_line = _parse_non_bool_int(args.get("StartLine"))
 
-        for raw_p in resolved_paths:
-            real_p = os.path.realpath(os.path.abspath(raw_p))
-            if not self.config.enabled:
-                decisions[real_p] = False
-                continue
-            if self.config.mode == "all":
-                decisions[real_p] = True
-                continue
-            if real_p in real_prompt_files:
-                decisions[real_p] = True
-                continue
-            if self.config.mode == "prompt_only":
-                decisions[real_p] = False
-                continue
-            if not self.is_within_workspace_paths(real_p, workspace_paths):
-                decisions[real_p] = True
-                continue
+        end_line = _parse_non_bool_int(opts_map.get("EndLine"))
+        if end_line is None:
+            end_line = _parse_non_bool_int(args.get("EndLine"))
 
-            repo_root = self._find_git_repo_root(os.path.dirname(real_p))
-            if not repo_root:
-                decisions[real_p] = True
-                continue
+        content_offset = _parse_non_bool_int(opts_map.get("ContentOffset"))
+        if content_offset is None:
+            content_offset = _parse_non_bool_int(args.get("ContentOffset"))
 
-            rel_path = os.path.relpath(real_p, repo_root).replace(os.sep, "/")
-            by_repo.setdefault(repo_root, []).append((real_p, rel_path))
+        byte_offset = _parse_non_bool_int(opts_map.get("ByteOffset"))
+        if byte_offset is None:
+            byte_offset = _parse_non_bool_int(args.get("ByteOffset"))
 
-        for repo_root, items in by_repo.items():
-            rel_list = [rel for _, rel in items]
-            try:
-                proc = subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        repo_root,
-                        "status",
-                        "--porcelain=v1",
-                        "--ignored=matching",
-                        "-z",
-                        "--untracked-files=normal",
-                        "--",
-                        *rel_list,
-                    ],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    timeout=GIT_STATUS_TIMEOUT_SECONDS,
-                    check=False,
-                )
-                if proc.returncode != 0:
-                    for real_p, _ in items:
-                        decisions[real_p] = True
-                    continue
+        if tool_name == "view_file":
+            raw_off = content_offset if content_offset is not None else byte_offset
+            return start_line, end_line, max(0, raw_off or 0), False
 
-                untrusted_exact: Set[str] = set()
-                untrusted_prefixes: List[str] = []
-                tokens = proc.stdout.decode("utf-8", errors="replace").split("\x00")
-                idx = 0
-                while idx < len(tokens):
-                    entry = tokens[idx]
-                    if len(entry) >= 4 and entry[2] == " ":
-                        xy = entry[:2]
-                        entry_path = entry[3:]
-                        if entry_path.endswith("/"):
-                            untrusted_prefixes.append(entry_path)
-                        else:
-                            untrusted_exact.add(entry_path)
-                        # In porcelain=v1 -z format, rename (R) and copy (C) entries
-                        # emit the origin path in the immediately following NUL token.
-                        if xy[0] in {"R", "C"} or xy[1] in {"R", "C"}:
-                            idx += 1
-                    idx += 1
+        if byte_offset is not None:
+            return start_line, end_line, max(0, byte_offset), True
+        if content_offset is not None:
+            return start_line, end_line, max(0, content_offset), False
+        return start_line, end_line, 0, True
 
-                for real_p, rel_p in items:
-                    is_flagged = rel_p in untrusted_exact or any(
-                        rel_p.startswith(prefix) for prefix in untrusted_prefixes
-                    )
-                    decisions[real_p] = is_flagged
-            except (OSError, subprocess.SubprocessError):
-                for real_p, _ in items:
-                    decisions[real_p] = True
-
-        return decisions
-
-    def should_scan_tool_file(
-        self,
-        resolved_path: str,
-        workspace_paths: Sequence[str],
-        prompt_files: Set[str],
-    ) -> bool:
-        """Single-file convenience wrapper around batch_check_should_scan."""
-        real_p = os.path.realpath(os.path.abspath(resolved_path))
-        res = self.batch_check_should_scan([real_p], workspace_paths, prompt_files)
-        return res.get(real_p, True)
+    def _classify_binary_action(self, real_path: str, head_bytes: bytes) -> PagedSliceResult:
+        """Maps a confirmed binary file to `BLOCK_MEDIA` or `SKIP`."""
+        mime_type = detect_multimodal_mime(real_path, head_bytes)
+        if (
+            self.config.on_unscannable_media == "BLOCK"
+            and is_unscannable_multimodal_mime(mime_type)
+        ):
+            base_name = os.path.basename(real_path)
+            return PagedSliceResult(
+                status="BLOCK_MEDIA",
+                reason=(
+                    f"Unscannable multimodal binary media '{base_name}' "
+                    f"({mime_type}) blocked under payload.on_unscannable_media=BLOCK."
+                ),
+            )
+        return PagedSliceResult(status="SKIP")
 
     def read_paged_slice(
         self,
         file_path: str,
-        start_line: Optional[int] = None,
-        end_line: Optional[int] = None,
+        start_line: int | None = None,
+        end_line: int | None = None,
         byte_offset: int = 0,
         workspace_paths: Sequence[str] = (),
-    ) -> Optional[Tuple[str, CachedSliceRecord]]:
-        """Streams a bounded line/byte slice aligned with Antigravity's ReadFileTool.
+        *,
+        tool_name: str = "read_file",
+        offset_is_formatted: bool | None = None,
+    ) -> PagedSliceResult:
+        """Streams a bounded UTF-8 slice or classifies binary/multimodal files.
 
-        Supports files up to 100 MiB without loading unselected lines into memory,
-        clamps StartLine past EOF to the final line, preserves CRLF byte lengths,
-        and applies a 128-byte overlap + formatted line-number coordinate union
-        when ByteOffset > 0.
-        """
-        resolved = self.resolve_candidate_path(file_path, workspace_paths)
-        if not resolved:
-            return None
-        try:
-            st = os.stat(resolved)
-            if st.st_size == 0 or st.st_size > MAX_PAGED_FILE_SIZE_BYTES:
-                return None
+        Strips an optional UTF-8 BOM at byte 0, sniffs MIME from the first 512
+        bytes, validates NUL-free strict UTF-8 across streamed 64 KiB rune-aligned
+        chunks, and slices `[max(0, offset - 512), offset + 46,080]` with exact
+        UTF-8 rune-boundary trimming at both ends.
 
-            with open(resolved, "rb") as fh:
-                sniff = fh.read(BINARY_SNIFF_BYTES)
-                if not sniff:
-                    return None
-                is_utf16 = sniff.startswith((b"\xff\xfe", b"\xfe\xff"))
-                if not is_utf16 and b"\x00" in sniff:
-                    return None
-
-                s_line = (
-                    int(start_line)
-                    if isinstance(start_line, int)
-                    and not isinstance(start_line, bool)
-                    and start_line >= 1
-                    else None
-                )
-                e_line = (
-                    int(end_line)
-                    if isinstance(end_line, int)
-                    and not isinstance(end_line, bool)
-                    and end_line >= 1
-                    else None
-                )
-                offset = (
-                    max(0, int(byte_offset))
-                    if isinstance(byte_offset, int)
-                    and not isinstance(byte_offset, bool)
-                    else 0
-                )
-
-                if is_utf16:
-                    if st.st_size > self.config.max_file_size_bytes:
-                        return None
-                    fh.seek(0)
-                    full_text = _decode_raw_bytes(fh.read(), sniff)
-                    if not full_text:
-                        return None
-                    all_lines = [
-                        ln.encode("utf-8") for ln in full_text.splitlines(keepends=True)
-                    ]
-                    if not all_lines:
-                        return None
-                    total_lines = len(all_lines)
-                    if s_line is None and e_line is None:
-                        s_idx, e_idx = 0, min(total_lines, MAX_SCAN_LINES_PER_VIEW)
-                    elif s_line is not None and e_line is None:
-                        s_idx = min(s_line - 1, total_lines - 1)
-                        e_idx = min(total_lines, s_idx + MAX_SCAN_LINES_PER_VIEW)
-                    elif s_line is None and e_line is not None:
-                        e_idx = min(e_line, total_lines)
-                        s_idx = max(0, e_idx - MAX_SCAN_LINES_PER_VIEW)
-                    else:
-                        assert s_line is not None and e_line is not None
-                        s_idx = min(s_line - 1, total_lines - 1)
-                        e_idx = min(
-                            total_lines, min(e_line, s_idx + MAX_SCAN_LINES_PER_VIEW)
-                        )
-                    selected = all_lines[s_idx:e_idx]
-                    s_line_1 = s_idx + 1
-                    e_line_1 = s_idx + len(selected)
-                else:
-                    fh.seek(0)
-                    if s_line is None and e_line is not None:
-                        target_end = e_line
-                        target_start = max(1, target_end - MAX_SCAN_LINES_PER_VIEW + 1)
-                    else:
-                        target_start = s_line if s_line is not None else 1
-                        target_end = (
-                            min(e_line, target_start + MAX_SCAN_LINES_PER_VIEW - 1)
-                            if e_line is not None
-                            else target_start + MAX_SCAN_LINES_PER_VIEW - 1
-                        )
-
-                    selected = []
-                    last_line_seen: Optional[bytes] = None
-                    last_line_num = 0
-                    for line_idx, raw_line in enumerate(fh, start=1):
-                        if line_idx == 1 and raw_line.startswith(b"\xef\xbb\xbf"):
-                            raw_line = raw_line[3:]
-                        last_line_seen = raw_line
-                        last_line_num = line_idx
-                        if line_idx < target_start:
-                            continue
-                        if line_idx > target_end:
-                            break
-                        selected.append(raw_line)
-
-                    if not selected:
-                        if last_line_seen is None:
-                            return None
-                        selected = [last_line_seen]
-                        s_line_1 = last_line_num
-                        e_line_1 = last_line_num
-                    else:
-                        s_line_1 = target_start
-                        e_line_1 = target_start + len(selected) - 1
-
-            raw_joined = b"".join(selected)
-            if offset == 0:
-                if (
-                    s_line is None
-                    and e_line is not None
-                    and len(raw_joined) > MAX_SCAN_BYTES_PER_VIEW
-                ):
-                    b_end = len(raw_joined)
-                    b_start = max(0, b_end - MAX_SCAN_BYTES_PER_VIEW)
-                    while (
-                        b_start < len(raw_joined)
-                        and (raw_joined[b_start] & 0xC0) == 0x80
-                    ):
-                        b_start += 1
-                else:
-                    b_start = 0
-                    b_end = min(len(raw_joined), MAX_SCAN_BYTES_PER_VIEW)
-            else:
-                # Account for Antigravity's IncludeLineNumbers=true formatting
-                # ("%d: " prefixes) so ByteOffset > 0 covers both formatted and
-                # unformatted coordinate spaces without injecting prefixes.
-                raw_pos = 0
-                fmt_pos = 0
-                raw_start_for_fmt: Optional[int] = None
-                for idx_sel, raw_line in enumerate(selected):
-                    line_num = s_line_1 + idx_sel
-                    prefix_len = len(f"{line_num}: ")
-                    line_fmt_len = prefix_len + len(raw_line)
-                    if fmt_pos + line_fmt_len > offset:
-                        within_fmt = max(0, offset - fmt_pos - prefix_len)
-                        raw_start_for_fmt = raw_pos + min(within_fmt, len(raw_line))
-                        break
-                    raw_pos += len(raw_line)
-                    fmt_pos += line_fmt_len
-
-                if raw_start_for_fmt is None:
-                    raw_start_for_fmt = len(raw_joined)
-
-                raw_start_unformatted = min(offset, len(raw_joined))
-                earliest_start = min(raw_start_for_fmt, raw_start_unformatted)
-                if earliest_start >= len(raw_joined) and raw_start_for_fmt >= len(
-                    raw_joined
-                ):
-                    return None
-
-                b_start = max(0, earliest_start - BYTE_OFFSET_OVERLAP_BYTES)
-                while (
-                    b_start < len(raw_joined)
-                    and (raw_joined[b_start] & 0xC0) == 0x80
-                ):
-                    b_start += 1
-                b_end = min(len(raw_joined), offset + MAX_SCAN_BYTES_PER_VIEW)
-
-            window = raw_joined[b_start:b_end]
-            decoded = window.decode("utf-8", errors="replace").strip()
-            if not decoded:
-                return None
-
-            record = CachedSliceRecord(
-                real_path=os.path.realpath(resolved),
-                mtime_ns=st.st_mtime_ns,
-                size=st.st_size,
-                start_line=s_line_1,
-                end_line=e_line_1,
-                byte_start=b_start,
-                byte_end=b_end,
-            )
-            return decoded, record
-        except OSError:
-            return None
-
-    def read_tail_slice(
-        self,
-        file_path: str,
-        workspace_paths: Sequence[str] = (),
-        max_bytes: int = MAX_SCAN_BYTES_PER_VIEW,
-    ) -> Optional[Tuple[str, CachedSliceRecord]]:
-        """Reads the trailing slice of a file from SEEK_END for shell `tail` commands."""
-        resolved = self.resolve_candidate_path(file_path, workspace_paths)
-        if not resolved:
-            return None
-        try:
-            st = os.stat(resolved)
-            if st.st_size == 0:
-                return None
-            with open(resolved, "rb") as fh:
-                sniff = fh.read(BINARY_SNIFF_BYTES)
-                if not sniff:
-                    return None
-                is_utf16 = sniff.startswith((b"\xff\xfe", b"\xfe\xff"))
-                if not is_utf16 and b"\x00" in sniff:
-                    return None
-                seek_pos = max(0, st.st_size - max_bytes)
-                fh.seek(seek_pos, os.SEEK_SET)
-                tail_bytes = fh.read(max_bytes)
-
-            if is_utf16:
-                decoded = _decode_raw_bytes(tail_bytes, sniff)
-            else:
-                start_trim = 0
-                while (
-                    start_trim < len(tail_bytes)
-                    and (tail_bytes[start_trim] & 0xC0) == 0x80
-                ):
-                    start_trim += 1
-                decoded = tail_bytes[start_trim:].decode("utf-8", errors="replace")
-
-            if not decoded or not decoded.strip():
-                return None
-            record = CachedSliceRecord(
-                real_path=os.path.realpath(resolved),
-                mtime_ns=st.st_mtime_ns,
-                size=st.st_size,
-                start_line=1,
-                end_line=MAX_SCAN_LINES_PER_VIEW,
-                byte_start=max(0, st.st_size - max_bytes),
-                byte_end=st.st_size,
-            )
-            return decoded.strip(), record
-        except OSError:
-            return None
-
-    def read_unpaged_slice(
-        self,
-        file_path: str,
-        workspace_paths: Sequence[str] = (),
-        max_bytes_override: Optional[int] = None,
-    ) -> Tuple[str, Optional[str], Optional[CachedSliceRecord]]:
-        """Reads an unpaginated file (`grep_search`, `notebook_edit`, `cat`) under policy caps.
+        Args:
+            file_path: Target path or `file://` URI.
+            start_line: Optional 1-indexed inclusive start line.
+            end_line: Optional 1-indexed inclusive end line.
+            byte_offset: Non-negative byte offset (`ByteOffset` or `ContentOffset`).
+            workspace_paths: Workspace roots for relative path resolution.
+            tool_name: `"read_file"` or `"view_file"` (controls `EndLine`-only
+                range semantics and default offset coordinate space).
+            offset_is_formatted: Explicit override for whether `byte_offset`
+                indexes `"%d: "` formatted bytes (`True`) or raw bytes (`False`).
 
         Returns:
-            Tuple of (action, text_or_reason, slice_record) where action is:
-              - "SCAN": text_or_reason contains the decoded file text to inspect.
-              - "BLOCK_POLICY": file exceeds max_file_size_bytes and oversize_action is BLOCK.
-              - "SKIP": file does not exist, is empty, or is binary.
+            `PagedSliceResult` with `status` in `{"SCAN", "BLOCK_MEDIA", "SKIP"}`.
         """
-        resolved = self.resolve_candidate_path(file_path, workspace_paths)
-        if not resolved:
-            return "SKIP", None, None
-        max_allowed = (
-            max_bytes_override
-            if max_bytes_override is not None
-            else self.config.max_file_size_bytes
-        )
+        real_path = self.resolve_candidate_path(file_path, workspace_paths)
+        if not real_path:
+            return PagedSliceResult(status="SKIP")
+
         try:
-            st = os.stat(resolved)
-            if st.st_size == 0:
-                return "SKIP", None, None
-            with open(resolved, "rb") as fh:
-                sniff = fh.read(BINARY_SNIFF_BYTES)
-                if not sniff:
-                    return "SKIP", None, None
-                is_utf16 = sniff.startswith((b"\xff\xfe", b"\xfe\xff"))
-                if not is_utf16 and b"\x00" in sniff:
-                    return "SKIP", None, None
+            st = os.stat(real_path)
+        except OSError:  # pragma: no cover - race after resolve_candidate_path
+            return PagedSliceResult(status="SKIP")
 
-                if (
-                    self.config.unpaged_scan_mode == "block"
-                    and st.st_size > MAX_SCAN_BYTES_PER_VIEW
-                ):
-                    return (
-                        "BLOCK_POLICY",
-                        (
-                            f"File '{os.path.basename(resolved)}' ({st.st_size:,} bytes) "
-                            f"exceeds single-view scan limit ({MAX_SCAN_BYTES_PER_VIEW:,} bytes) "
-                            "under unpaged_scan_mode='block'. Use read_file with StartLine/EndLine pagination."
-                        ),
-                        None,
-                    )
+        if st.st_size <= 0 or st.st_size > MAX_PAGED_FILE_SIZE_BYTES:
+            return PagedSliceResult(status="SKIP")
 
-                if st.st_size > max_allowed:
-                    if self.config.oversize_action == "BLOCK":
-                        return (
-                            "BLOCK_POLICY",
-                            (
-                                f"File '{os.path.basename(resolved)}' ({st.st_size:,} bytes) "
-                                f"exceeds max_file_size_bytes ({self.config.max_file_size_bytes:,} bytes) "
-                                "for unpaginated inspection. Use read_file with StartLine/EndLine pagination."
-                            ),
-                            None,
-                        )
-                    half = MAX_SCAN_BYTES_PER_VIEW // 2
-                    fh.seek(0)
-                    head_b = fh.read(half)
-                    fh.seek(max(0, st.st_size - half), os.SEEK_SET)
-                    tail_b = fh.read(half)
-                    combined = (
-                        head_b.decode("utf-8", errors="replace")
-                        + "\n...\n"
-                        + tail_b.decode("utf-8", errors="replace")
-                    ).strip()
-                    return ("SCAN", combined, None) if combined else ("SKIP", None, None)
-
-                fh.seek(0)
-                raw = fh.read(max_allowed)
-            decoded = _decode_raw_bytes(raw, sniff)
-            if not decoded or not decoded.strip():
-                return "SKIP", None, None
-            record = CachedSliceRecord(
-                real_path=os.path.realpath(resolved),
-                mtime_ns=st.st_mtime_ns,
-                size=st.st_size,
-                start_line=1,
-                end_line=1_000_000_000,
-                byte_start=0,
-                byte_end=st.st_size,
+        if tool_name == "view_file" and start_line is None and end_line is not None:
+            eff_end = max(1, end_line)
+            eff_start = max(1, eff_end - MAX_SCAN_LINES_PER_VIEW + 1)
+        else:
+            eff_start = max(1, start_line if start_line is not None else 1)
+            raw_end = (
+                max(eff_start, end_line)
+                if end_line is not None
+                else eff_start + MAX_SCAN_LINES_PER_VIEW - 1
             )
-            return "SCAN", decoded.strip(), record
-        except OSError:
-            return "SKIP", None, None
+            eff_end = min(raw_end, eff_start + MAX_SCAN_LINES_PER_VIEW - 1)
 
-    def extract_prompt_file_paths(
-        self, prompt_text: str, workspace_paths: Sequence[str] = ()
-    ) -> List[str]:
-        """Extracts deduplicated, resolved file paths from @file mentions and inline paths."""
-        if not prompt_text:
-            return []
-        raw_candidates: List[str] = []
+        eff_offset = max(0, byte_offset)
+        use_formatted = (
+            offset_is_formatted
+            if offset_is_formatted is not None
+            else (tool_name == "read_file" and eff_offset > 0)
+        )
+        if eff_offset == 0:
+            use_formatted = False
 
-        for match in _TRANSCRIPT_FILE_RE.finditer(prompt_text):
-            raw_candidates.append(match.group(1).strip())
-        for match in _TRANSCRIPT_CODE_ITEM_RE.finditer(prompt_text):
-            try:
-                meta = json.loads(match.group(1))
-                if isinstance(meta, dict) and isinstance(meta.get("File"), str):
-                    raw_candidates.append(meta["File"])
-            except Exception:
-                pass
-        for match in _AT_MENTION_RE.finditer(prompt_text):
-            token = next((group for group in match.groups() if group), "")
-            if token:
-                raw_candidates.append(token)
-        for match in _PATH_TOKEN_RE.finditer(prompt_text):
-            token = next((group for group in match.groups() if group), "")
-            if not token:
-                continue
-            cleaned_token = token.rstrip(".,;:!?")
-            if (
-                cleaned_token.startswith(("http://", "https://"))
-                or "@" in cleaned_token
-                or _is_prose_non_path_token(cleaned_token)
-            ):
-                continue
-            if (
-                "/" in cleaned_token
-                or "\\" in cleaned_token
-                or bool(_FILE_EXTENSION_RE.search(cleaned_token))
-            ):
-                raw_candidates.append(cleaned_token)
+        win_start = (
+            max(0, eff_offset - BYTE_OFFSET_OVERLAP_BYTES) if eff_offset > 0 else 0
+        )
+        win_end = eff_offset + MAX_SCAN_BYTES_PER_VIEW
 
-        seen_raw: Set[str] = set()
-        seen_real: Set[str] = set()
-        resolved_paths: List[str] = []
-        for raw_path in raw_candidates:
-            norm_key = raw_path.strip().strip("\"'`[]()").rstrip(".,;:!?")
-            if not norm_key or norm_key in seen_raw:
-                continue
-            seen_raw.add(norm_key)
+        window = _BoundedByteWindow(win_start, win_end)
+        last_line_window = _BoundedByteWindow(win_start, win_end)
 
-            resolved = self.resolve_candidate_path(norm_key, workspace_paths)
-            if not resolved:
-                continue
-            real_path = os.path.realpath(resolved)
-            if real_path in seen_real:
-                continue
-            seen_real.add(real_path)
-            resolved_paths.append(resolved)
-        return resolved_paths
+        try:
+            with open(real_path, "rb") as fh:
+                first_raw = fh.read(STREAM_CHUNK_BYTES)
+                if first_raw.startswith(_UTF8_BOM):
+                    first_raw = first_raw[len(_UTF8_BOM) :]
+                if not first_raw:
+                    return PagedSliceResult(status="SKIP")
 
-    def extract_prompt_scan_target(
+                head_512 = first_raw[:MIME_SNIFF_BYTES]
+                if head_512.startswith(b"%PDF-"):
+                    return self._classify_binary_action(real_path, head_512)
+
+                carry = b""
+                cur_raw = first_raw
+                current_line = 0
+                at_line_start = True
+                matched_any_line = False
+                lines_done = False
+
+                while True:
+                    raw_buf = carry + cur_raw
+                    next_probe = fh.read(STREAM_CHUNK_BYTES)
+                    at_eof = len(next_probe) == 0
+                    if not at_eof:
+                        chunk, carry = _split_incomplete_utf8_tail(raw_buf)
+                    else:
+                        chunk, carry = raw_buf, b""
+
+                    if b"\x00" in chunk:
+                        return self._classify_binary_action(real_path, head_512)
+                    try:
+                        chunk.decode("utf-8")
+                    except UnicodeDecodeError:
+                        return self._classify_binary_action(real_path, head_512)
+
+                    if not lines_done:
+                        pos = 0
+                        chunk_len = len(chunk)
+                        while pos < chunk_len:
+                            nl_idx = chunk.find(b"\n", pos)
+                            has_nl = nl_idx != -1
+                            seg_end = (nl_idx + 1) if has_nl else chunk_len
+                            seg = chunk[pos:seg_end]
+                            line_started_here = at_line_start
+                            if at_line_start:
+                                current_line += 1
+                            at_line_start = has_nl
+                            pos = seg_end
+
+                            if current_line < eff_start:
+                                if line_started_here:
+                                    last_line_window = _BoundedByteWindow(
+                                        win_start, win_end
+                                    )
+                                    if use_formatted:
+                                        last_line_window.advance_virtual(
+                                            len(str(current_line)) + 2
+                                        )
+                                last_line_window.append_segment(seg)
+                            else:
+                                matched_any_line = True
+                                if line_started_here and use_formatted:
+                                    window.advance_virtual(
+                                        len(str(current_line)) + 2
+                                    )
+                                window.append_segment(seg)
+                                if current_line == eff_end and has_nl:
+                                    lines_done = True
+                                    break
+                        # Note: `current_line` only increments when `at_line_start` is True,
+                        # and `current_line == eff_end and has_nl` breaks immediately, so
+                        # `current_line` never exceeds `eff_end` while `not lines_done`.
+
+                    if at_eof:
+                        break
+                    cur_raw = next_probe
+        except OSError:  # pragma: no cover - race after resolve_candidate_path
+            return PagedSliceResult(status="SKIP")
+
+        target_window = window if matched_any_line else last_line_window
+        decoded = target_window.decode_utf8()
+        if not decoded.strip():
+            return PagedSliceResult(status="SKIP")
+        return PagedSliceResult(status="SCAN", content=decoded)
+
+    def extract_notebook_view(
         self,
-        prompt_text: str,
-        source_prefix: str,
+        notebook_path: str,
+        action: str,
+        cell_index: Any = None,
         workspace_paths: Sequence[str] = (),
-    ) -> ScanExtractionResult:
-        """Extracts prompt text plus any referenced file slices for PreInvocation scanning."""
-        if not prompt_text or not prompt_text.strip():
-            return ScanExtractionResult(action="NO_ACTIONABLE_TEXT")
+    ) -> PagedSliceResult:
+        """Parses an `.ipynb` (`<= 10 MiB`) for `list`, `get`, or `get_with_outputs`.
 
-        if not self.config.enabled:
-            return ScanExtractionResult(
-                action="SCAN",
-                text_to_scan=prompt_text,
-                source=source_prefix,
+        Matches `notebook_subhandler.go` cell rendering, blocks multimodal binary
+        `outputs[].data` under `on_unscannable_media == "BLOCK"`, and enforces
+        `MAX_PRE_READ_SCAN_CHARS` (`250,000` chars).
+
+        Args:
+            notebook_path: Path or `file://` URI to the `.ipynb` file.
+            action: Lowercased `notebook_edit` action (`list`, `get`,
+                `get_with_outputs`).
+            cell_index: Requested 0-based `CellIndex` for `get` /
+                `get_with_outputs`.
+            workspace_paths: Workspace root directories for relative resolution.
+
+        Returns:
+            `PagedSliceResult` with `status` in
+            `{"SCAN", "BLOCK_MEDIA", "BLOCK_OVERSIZE", "SKIP"}`.
+        """
+        real_path = self.resolve_candidate_path(notebook_path, workspace_paths)
+        if not real_path:
+            return PagedSliceResult(status="SKIP")
+
+        try:
+            st = os.stat(real_path)
+        except OSError:  # pragma: no cover - race after resolve_candidate_path
+            return PagedSliceResult(status="SKIP")
+
+        if st.st_size <= 0:
+            return PagedSliceResult(status="SKIP")
+
+        if st.st_size > NOTEBOOK_MAX_FILE_BYTES:
+            return PagedSliceResult(
+                status="BLOCK_OVERSIZE",
+                reason=(
+                    f"Notebook '{os.path.basename(real_path)}' ({st.st_size} bytes) "
+                    f"exceeds {NOTEBOOK_MAX_FILE_BYTES}-byte (10 MiB) pre-read limit."
+                ),
             )
 
-        resolved_paths = self.extract_prompt_file_paths(
-            prompt_text, workspace_paths
-        )
-        snippets: List[str] = []
-        slice_records: List[CachedSliceRecord] = []
-        for resolved in resolved_paths:
-            paged = self.read_paged_slice(
-                resolved, start_line=1, end_line=MAX_SCAN_LINES_PER_VIEW, byte_offset=0, workspace_paths=workspace_paths
+        try:
+            with open(real_path, "rb") as fh:
+                raw_bytes = fh.read(NOTEBOOK_MAX_FILE_BYTES + 1)
+        except OSError:  # pragma: no cover - race after resolve_candidate_path
+            return PagedSliceResult(status="SKIP")
+
+        if len(raw_bytes) > NOTEBOOK_MAX_FILE_BYTES:  # pragma: no cover - concurrent growth
+            return PagedSliceResult(
+                status="BLOCK_OVERSIZE",
+                reason=(
+                    f"Notebook '{os.path.basename(real_path)}' exceeds "
+                    f"{NOTEBOOK_MAX_FILE_BYTES}-byte (10 MiB) pre-read limit."
+                ),
             )
-            if paged is not None:
-                content, record = paged
-                snippets.append(f"[File: {resolved}]\n{content}")
-                slice_records.append(record)
 
-        if snippets:
-            combined = f"{prompt_text}\n\n" + "\n\n".join(snippets)
-            return ScanExtractionResult(
-                action="SCAN",
-                text_to_scan=combined,
-                source=f"{source_prefix}+files",
-                scanned_slices=tuple(slice_records),
-                prompt_files=tuple(resolved_paths),
-            )
-        return ScanExtractionResult(
-            action="SCAN",
-            text_to_scan=prompt_text,
-            source=source_prefix,
-            prompt_files=tuple(resolved_paths),
-        )
+        if raw_bytes.startswith(_UTF8_BOM):
+            raw_bytes = raw_bytes[len(_UTF8_BOM) :]
+        head_512 = raw_bytes[:MIME_SNIFF_BYTES]
+        if head_512.startswith(b"%PDF-") or b"\x00" in raw_bytes:
+            return self._classify_binary_action(real_path, head_512)
 
-    def _extract_shell_candidates(
-        self,
-        cmd_line: str,
-        workspace_paths: Sequence[str],
-        prompt_files: Optional[Set[str]] = None,
-    ) -> List[Tuple[str, bool]]:
-        """Extracts deduplicated (resolved_path, is_tail) pairs from shell read commands."""
-        found: List[Tuple[str, bool]] = []
-        seen_real: Set[str] = set()
+        try:
+            nb_data = json.loads(raw_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return PagedSliceResult(status="SKIP")
 
-        for segment in _split_shell_segments(cmd_line):
-            try:
-                tokens = shlex.split(segment, posix=(os.name != "nt"))
-            except ValueError:
-                tokens = segment.split()
-            if not tokens:
-                continue
+        if not isinstance(nb_data, Mapping):
+            return PagedSliceResult(status="SKIP")
+        cells = nb_data.get("cells")
+        if not isinstance(cells, list):
+            return PagedSliceResult(status="SKIP")
 
-            idx = 0
-            while idx < len(tokens) and (
-                "=" in tokens[idx]
-                or tokens[idx]
-                in {"sudo", "env", "command", "nohup", "time", "nice"}
-            ):
-                idx += 1
-            if idx >= len(tokens):
-                continue
-
-            cmd_base = os.path.basename(tokens[idx]).lower()
-            if cmd_base.endswith(".exe"):
-                cmd_base = cmd_base[:-4]
-            if cmd_base not in SHELL_READ_COMMANDS:
-                continue
-
-            is_tail = cmd_base == "tail"
-            raw_args: List[str] = []
-            for arg in tokens[idx + 1 :]:
-                if arg.startswith("-"):
-                    if "=" in arg:
-                        _, rhs = arg.split("=", 1)
-                        if rhs:
-                            raw_args.append(rhs.lstrip("@"))
-                    elif len(arg) > 2 and arg[2:].startswith("@"):
-                        raw_args.append(arg[3:])
+        act = action.strip().lower()
+        if act == "list":
+            lines = [f"Notebook has {len(cells)} cells:"]
+            for idx, cell in enumerate(cells):
+                if not isinstance(cell, Mapping):
                     continue
-                if arg.startswith("@") and len(arg) > 1:
-                    raw_args.append(arg[1:])
+                cell_type = str(cell.get("cell_type") or "unknown")
+                src_text = _flatten_notebook_source(cell.get("source"))
+                preview = src_text.replace("\n", "\\n")
+                if len(preview) > 100:
+                    preview = preview[:100] + "..."
+                lines.append(f"[{idx}] {cell_type}: {preview}")
+            rendered = "\n".join(lines)
+        elif act in {"get", "get_with_outputs"}:
+            idx_val = _parse_non_bool_int(cell_index)
+            if idx_val is None or idx_val < 0 or idx_val >= len(cells):
+                return PagedSliceResult(status="SKIP")
+            cell = cells[idx_val]
+            if not isinstance(cell, Mapping):
+                return PagedSliceResult(status="SKIP")
+            cell_type = str(cell.get("cell_type") or "unknown")
+            src_text = _flatten_notebook_source(cell.get("source"))
+
+            if act == "get_with_outputs":
+                outputs = cell.get("outputs")
+                if isinstance(outputs, list):
+                    if self.config.on_unscannable_media == "BLOCK":
+                        for out_item in outputs:
+                            if not isinstance(out_item, Mapping):
+                                continue
+                            data_bundle = out_item.get("data")
+                            if not isinstance(data_bundle, Mapping):
+                                continue
+                            for mime_key, payload_val in data_bundle.items():
+                                if is_unscannable_multimodal_mime(
+                                    str(mime_key)
+                                ) and _has_non_empty_output_payload(payload_val):
+                                    return PagedSliceResult(
+                                        status="BLOCK_MEDIA",
+                                        reason=(
+                                            f"Notebook cell [{idx_val}] output contains "
+                                            f"unscannable binary media ({mime_key}) "
+                                            f"blocked under payload.on_unscannable_media=BLOCK."
+                                        ),
+                                    )
+                    if outputs:
+                        outputs_json = json.dumps(
+                            outputs, ensure_ascii=False, indent=2
+                        )
+                        rendered = (
+                            f"Cell [{idx_val}] ({cell_type}):\n{src_text}\n\n"
+                            f"Outputs:\n{outputs_json}"
+                        )
+                    else:
+                        rendered = f"Cell [{idx_val}] ({cell_type}):\n{src_text}"
                 else:
-                    raw_args.append(arg)
-                for inline_match in _INLINE_FILE_LITERAL_RE.finditer(arg):
-                    raw_args.append(inline_match.group(1))
+                    rendered = f"Cell [{idx_val}] ({cell_type}):\n{src_text}"
+            else:
+                rendered = f"Cell [{idx_val}] ({cell_type}):\n{src_text}"
+        else:
+            return PagedSliceResult(status="SKIP")
 
-            segment_matched = False
-            active_prompt_files = prompt_files or set()
-            for candidate in raw_args:
-                resolved = self.resolve_candidate_path(candidate, workspace_paths)
-                if resolved:
-                    segment_matched = True
-                    real_p = os.path.realpath(resolved)
-                    if real_p not in seen_real:
-                        seen_real.add(real_p)
-                        found.append((resolved, is_tail))
-                    continue
-                if cmd_base in SHELL_SEARCH_COMMANDS:
-                    resolved_dir = self.resolve_candidate_directory(
-                        candidate, workspace_paths
-                    )
-                    if resolved_dir:
-                        segment_matched = True
-                        for exp_file in self.expand_directory_targets(
-                            resolved_dir, workspace_paths, active_prompt_files
-                        ):
-                            real_exp = os.path.realpath(exp_file)
-                            if real_exp not in seen_real:
-                                seen_real.add(real_exp)
-                                found.append((exp_file, False))
-
-            if cmd_base in SHELL_SEARCH_COMMANDS and not segment_matched:
-                default_dirs = list(workspace_paths) if workspace_paths else ["."]
-                for def_dir in default_dirs:
-                    resolved_dir = self.resolve_candidate_directory(
-                        def_dir, workspace_paths
-                    )
-                    if resolved_dir:
-                        for exp_file in self.expand_directory_targets(
-                            resolved_dir, workspace_paths, active_prompt_files
-                        ):
-                            real_exp = os.path.realpath(exp_file)
-                            if real_exp not in seen_real:
-                                seen_real.add(real_exp)
-                                found.append((exp_file, False))
-        return found
-
-    @staticmethod
-    def _is_covered_by_cache(
-        record: CachedSliceRecord, cached_slices: Sequence[CachedSliceRecord]
-    ) -> bool:
-        """Returns True if record's file version and range are already covered in cached_slices."""
-        return any(
-            existing.covers(
-                record.real_path,
-                record.mtime_ns,
-                record.size,
-                record.start_line,
-                record.end_line,
-                record.byte_start,
-                record.byte_end,
+        if len(rendered) > MAX_PRE_READ_SCAN_CHARS:
+            return PagedSliceResult(
+                status="BLOCK_OVERSIZE",
+                reason=(
+                    f"Notebook '{os.path.basename(real_path)}' view ({len(rendered)} chars) "
+                    f"exceeds {MAX_PRE_READ_SCAN_CHARS}-character pre-read scan limit."
+                ),
             )
-            for existing in cached_slices
-        )
+
+        return PagedSliceResult(status="SCAN", content=rendered)
 
     @classmethod
-    def _collect_nested_strings(cls, value: Any) -> List[str]:
-        """Recursively collects string and numeric values from nested dicts and lists."""
-        collected: List[str] = []
+    def _collect_nested_strings(cls, value: Any) -> list[str]:
+        """Recursively collects non-empty string and numeric values from `args`."""
+        collected: list[str] = []
         if isinstance(value, str):
             if value.strip():
                 collected.append(value)
         elif isinstance(value, (int, float)) and not isinstance(value, bool):
             collected.append(str(value))
-        elif isinstance(value, dict):
+        elif isinstance(value, Mapping):
             for nested_val in value.values():
                 collected.extend(cls._collect_nested_strings(nested_val))
         elif isinstance(value, (list, tuple)):
@@ -1572,265 +1128,115 @@ class FileScanner:
                 collected.extend(cls._collect_nested_strings(item))
         return collected
 
+    @staticmethod
+    def _build_slice_scan_result(
+        tool: str, slice_text: str, args_text: str
+    ) -> ScanExtractionResult:
+        """Combines extracted `slice_text` and `args_text` under the 250k-char cap."""
+        combined = f"{args_text}\n{slice_text}" if args_text else slice_text
+        if len(combined) > MAX_PRE_READ_SCAN_CHARS:
+            return ScanExtractionResult(
+                action="BLOCK_POLICY",
+                block_reason=(
+                    f"Combined {tool} scan payload ({len(combined)} chars) "
+                    f"exceeds {MAX_PRE_READ_SCAN_CHARS}-character limit."
+                ),
+                source=f"tool_oversize:{tool}",
+            )
+        return ScanExtractionResult(
+            action="SCAN",
+            text_to_scan=combined,
+            source=f"tool_file_content:{tool}",
+            slice_text=slice_text,
+            args_text=args_text,
+        )
+
     def extract_tool_scan_target(
         self, request: ToolScanRequest
     ) -> ScanExtractionResult:
-        """Evaluates a PreToolUse request for readable file slices and inline arguments."""
+        """Extracts file/notebook read slices combined with `_collect_nested_strings`."""
         tool = (request.tool_name or "").strip()
         args = request.tool_args or {}
-        ws_paths = request.workspace_paths or []
+        ws_paths = request.workspace_paths or ()
 
-        # 1. Inspect file-reading tools when file scanning is enabled.
-        if self.config.enabled:
-            if tool in FILE_READ_TOOLS:
+        nested_strings = self._collect_nested_strings(args)
+        args_text = "\n".join(nested_strings)
+
+        if self.config.pre_read_scan:
+            if tool in PAGED_FILE_READ_TOOLS:
                 raw_path = (
                     args.get("Path")
                     or args.get("AbsolutePath")
                     or args.get("File")
                 )
                 if isinstance(raw_path, str) and raw_path.strip():
-                    resolved = self.resolve_candidate_path(raw_path, ws_paths)
-                    if resolved and self.should_scan_tool_file(
-                        resolved, ws_paths, request.prompt_files
-                    ):
-                        start_line = args.get("StartLine")
-                        end_line = args.get("EndLine")
-                        byte_offset = (
-                            args.get("ByteOffset")
-                            or args.get("ContentOffset")
-                            or 0
+                    start_line, end_line, offset, is_fmt = (
+                        self._resolve_pagination_args(tool, args)
+                    )
+                    paged = self.read_paged_slice(
+                        raw_path,
+                        start_line=start_line,
+                        end_line=end_line,
+                        byte_offset=offset,
+                        workspace_paths=ws_paths,
+                        tool_name=tool,
+                        offset_is_formatted=is_fmt,
+                    )
+                    if paged.status == "BLOCK_MEDIA":
+                        return ScanExtractionResult(
+                            action="BLOCK_POLICY",
+                            block_reason=paged.reason,
+                            source=f"tool_unscannable_media:{tool}",
                         )
-                        paged = self.read_paged_slice(
-                            resolved,
-                            start_line=start_line,
-                            end_line=end_line,
-                            byte_offset=byte_offset,
-                            workspace_paths=ws_paths,
+                    if paged.status == "SCAN":
+                        return self._build_slice_scan_result(
+                            tool, paged.content, args_text
                         )
-                        if paged is not None:
-                            content, record = paged
-                            if self._is_covered_by_cache(
-                                record, request.cached_slices
-                            ):
-                                return ScanExtractionResult(
-                                    action="SKIP_CACHED",
-                                    source=f"tool_file_cached:{tool}",
-                                )
-                            return ScanExtractionResult(
-                                action="SCAN",
-                                text_to_scan=f"{raw_path}\n{content}",
-                                source=f"tool_file_content:{tool}",
-                                scanned_slices=(record,),
-                            )
 
             elif tool == "notebook_edit":
-                action = str(args.get("Action") or "list").lower()
-                nb_path = args.get("NotebookPath")
-                if action in {"list", "get", "get_with_outputs"} and isinstance(
-                    nb_path, str
+                action = str(args.get("Action") or "list").strip().lower()
+                nb_path = (
+                    args.get("NotebookPath")
+                    or args.get("Path")
+                    or args.get("AbsolutePath")
+                )
+                if (
+                    action in NOTEBOOK_READ_ACTIONS
+                    and isinstance(nb_path, str)
+                    and nb_path.strip()
                 ):
-                    resolved = self.resolve_candidate_path(nb_path, ws_paths)
-                    if resolved and self.should_scan_tool_file(
-                        resolved, ws_paths, request.prompt_files
-                    ):
-                        act, text_or_err, record = self.read_unpaged_slice(
-                            resolved, ws_paths
-                        )
-                        if act == "BLOCK_POLICY":
-                            return ScanExtractionResult(
-                                action="BLOCK_POLICY",
-                                block_reason=text_or_err or "Oversize notebook blocked.",
-                                source="tool_file_oversize:notebook_edit",
-                            )
-                        if act == "SCAN" and text_or_err:
-                            if record and self._is_covered_by_cache(
-                                record, request.cached_slices
-                            ):
-                                return ScanExtractionResult(
-                                    action="SKIP_CACHED",
-                                    source="tool_file_cached:notebook_edit",
-                                )
-                            return ScanExtractionResult(
-                                action="SCAN",
-                                text_to_scan=f"{nb_path}\n{text_or_err}",
-                                source="tool_file_content:notebook_edit",
-                                scanned_slices=(record,) if record else (),
-                            )
-
-            elif tool == "grep_search":
-                search_path = args.get("SearchPath")
-                if isinstance(search_path, str) and search_path.strip():
-                    resolved = self.resolve_candidate_path(search_path, ws_paths)
-                    if resolved and self.should_scan_tool_file(
-                        resolved, ws_paths, request.prompt_files
-                    ):
-                        act, text_or_err, record = self.read_unpaged_slice(
-                            resolved, ws_paths
-                        )
-                        if act == "BLOCK_POLICY":
-                            return ScanExtractionResult(
-                                action="BLOCK_POLICY",
-                                block_reason=text_or_err or "Oversize file blocked.",
-                                source="tool_file_oversize:grep_search",
-                            )
-                        if act == "SCAN" and text_or_err:
-                            query = str(args.get("Query") or "")
-                            if record and self._is_covered_by_cache(
-                                record, request.cached_slices
-                            ):
-                                if query.strip():
-                                    return ScanExtractionResult(
-                                        action="SCAN",
-                                        text_to_scan=f"{query}\n{search_path}",
-                                        source="tool_args:grep_search",
-                                    )
-                                return ScanExtractionResult(
-                                    action="SKIP_CACHED",
-                                    source="tool_file_cached:grep_search",
-                                )
-                            return ScanExtractionResult(
-                                action="SCAN",
-                                text_to_scan=f"{query}\n{search_path}\n{text_or_err}",
-                                source="tool_file_content:grep_search",
-                                scanned_slices=(record,) if record else (),
-                            )
-                    elif not resolved:
-                        resolved_dir = self.resolve_candidate_directory(
-                            search_path, ws_paths
-                        )
-                        if resolved_dir:
-                            dir_targets = self.expand_directory_targets(
-                                resolved_dir, ws_paths, request.prompt_files
-                            )
-                            if dir_targets:
-                                query = str(args.get("Query") or "")
-                                dir_snippets: List[str] = []
-                                new_records: List[CachedSliceRecord] = []
-                                remaining_budget = self.config.max_file_size_bytes
-                                for target_file in dir_targets:
-                                    act, text_or_err, record = self.read_unpaged_slice(
-                                        target_file,
-                                        ws_paths,
-                                        max_bytes_override=max(0, remaining_budget),
-                                    )
-                                    if act == "BLOCK_POLICY":
-                                        return ScanExtractionResult(
-                                            action="BLOCK_POLICY",
-                                            block_reason=text_or_err
-                                            or "Oversize file in directory grep_search blocked.",
-                                            source="tool_file_oversize:grep_search",
-                                        )
-                                    if act == "SCAN" and text_or_err:
-                                        try:
-                                            remaining_budget -= os.path.getsize(target_file)
-                                        except OSError:
-                                            pass
-                                        if record and self._is_covered_by_cache(
-                                            record, request.cached_slices
-                                        ):
-                                            continue
-                                        dir_snippets.append(
-                                            f"[File: {target_file}]\n{text_or_err}"
-                                        )
-                                        if record:
-                                            new_records.append(record)
-                                if dir_snippets:
-                                    header = f"{query}\n{search_path}".strip()
-                                    combined = (
-                                        "\n\n".join([header, *dir_snippets])
-                                        if header
-                                        else "\n\n".join(dir_snippets)
-                                    )
-                                    return ScanExtractionResult(
-                                        action="SCAN",
-                                        text_to_scan=combined,
-                                        source="tool_file_content:grep_search",
-                                        scanned_slices=tuple(new_records),
-                                    )
-
-            elif tool == "run_command":
-                cmd_line = args.get("CommandLine")
-                if isinstance(cmd_line, str) and cmd_line.strip():
-                    candidates = self._extract_shell_candidates(
-                        cmd_line, ws_paths, request.prompt_files
+                    nb_res = self.extract_notebook_view(
+                        nb_path,
+                        action=action,
+                        cell_index=args.get("CellIndex"),
+                        workspace_paths=ws_paths,
                     )
-                    if candidates:
-                        cand_paths = [p for p, _ in candidates]
-                        trust_map = self.batch_check_should_scan(
-                            cand_paths, ws_paths, request.prompt_files
+                    if nb_res.status in {"BLOCK_MEDIA", "BLOCK_OVERSIZE"}:
+                        return ScanExtractionResult(
+                            action="BLOCK_POLICY",
+                            block_reason=nb_res.reason,
+                            source=f"tool_notebook_block:{action}",
                         )
-                        shell_snippets: List[str] = []
-                        new_records: List[CachedSliceRecord] = []
-                        remaining_budget = self.config.max_file_size_bytes
+                    if nb_res.status == "SCAN":
+                        return self._build_slice_scan_result(
+                            "notebook_edit", nb_res.content, args_text
+                        )
 
-                        for resolved, is_tail in candidates:
-                            real_p = os.path.realpath(resolved)
-                            if not trust_map.get(real_p, True):
-                                continue
-                            if is_tail:
-                                tail_res = self.read_tail_slice(resolved, ws_paths)
-                                if tail_res is not None:
-                                    content, record = tail_res
-                                    if not self._is_covered_by_cache(
-                                        record, request.cached_slices
-                                    ):
-                                        shell_snippets.append(content)
-                                        new_records.append(record)
-                                continue
-
-                            act, text_or_err, record = self.read_unpaged_slice(
-                                resolved,
-                                ws_paths,
-                                max_bytes_override=max(0, remaining_budget),
-                            )
-                            if act == "BLOCK_POLICY":
-                                return ScanExtractionResult(
-                                    action="BLOCK_POLICY",
-                                    block_reason=text_or_err
-                                    or "Command file read exceeds max_file_size_bytes.",
-                                    source="tool_file_oversize:run_command",
-                                )
-                            if act == "SCAN" and text_or_err:
-                                try:
-                                    remaining_budget -= os.path.getsize(resolved)
-                                except OSError:
-                                    pass
-                                if record and self._is_covered_by_cache(
-                                    record, request.cached_slices
-                                ):
-                                    continue
-                                shell_snippets.append(text_or_err)
-                                if record:
-                                    new_records.append(record)
-
-                        if shell_snippets:
-                            combined = "\n\n".join([cmd_line, *shell_snippets])
-                            return ScanExtractionResult(
-                                action="SCAN",
-                                text_to_scan=combined,
-                                source="tool_file_content:run_command",
-                                scanned_slices=tuple(new_records),
-                            )
-
-        # 2. Fallback: inspect inline string arguments on the tool call.
-        parts: List[str] = []
-        for key in INLINE_TEXT_KEYS:
-            val = args.get(key)
-            if val and isinstance(val, str):
-                parts.append(val)
-        if parts:
+        if args_text.strip():
+            if len(args_text) > MAX_PRE_READ_SCAN_CHARS:
+                return ScanExtractionResult(
+                    action="BLOCK_POLICY",
+                    block_reason=(
+                        f"Tool arguments ({len(args_text)} chars) exceed "
+                        f"{MAX_PRE_READ_SCAN_CHARS}-character pre-read scan limit."
+                    ),
+                    source=f"tool_args_oversize:{tool}",
+                )
             return ScanExtractionResult(
                 action="SCAN",
-                text_to_scan="\n".join(parts),
+                text_to_scan=args_text,
                 source=f"tool_args:{tool}",
-            )
-
-        all_str_vals = self._collect_nested_strings(args)
-        if all_str_vals:
-            return ScanExtractionResult(
-                action="SCAN",
-                text_to_scan=" ".join(all_str_vals),
-                source=f"tool_args_all:{tool}",
+                args_text=args_text,
             )
 
         return ScanExtractionResult(action="NO_ACTIONABLE_TEXT")

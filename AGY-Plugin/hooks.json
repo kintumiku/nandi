@@ -5,7 +5,7 @@
       {
         "type": "command",
         "command": ".venv/bin/python3 src/hooks/pii_hook.py --event=pre_invocation",
-        "timeout": 15
+        "timeout": 30
       }
     ],
     "PreToolUse": [
@@ -15,7 +15,7 @@
           {
             "type": "command",
             "command": ".venv/bin/python3 src/hooks/pii_hook.py --event=pre_tool_use",
-            "timeout": 15
+            "timeout": 30
           }
         ]
       }
@@ -24,7 +24,7 @@
       {
         "type": "command",
         "command": ".venv/bin/python3 src/hooks/pii_hook.py --event=post_invocation",
-        "timeout": 15
+        "timeout": 30
       }
     ]
   },
@@ -53,7 +53,7 @@
       {
         "type": "command",
         "command": ".venv/bin/python3 src/hooks/model_armor_hook.py --event=post_invocation",
-        "timeout": 15
+        "timeout": 30
       }
     ]
   },
@@ -82,7 +82,7 @@
       {
         "type": "command",
         "command": ".venv/bin/python3 src/hooks/combined_guard_hook.py --event=post_invocation",
-        "timeout": 15
+        "timeout": 30
       }
     ]
   }

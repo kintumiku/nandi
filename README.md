@@ -6,7 +6,7 @@
 [![Compliance: SEBI CSCRF 2024](https://img.shields.io/badge/Compliance-SEBI%20CSCRF%202024-green)](docs/SEBI_COMPLIANCE.md)
 [![Compliance: DPDP Act 2023](https://img.shields.io/badge/Compliance-DPDP%20Act%202023-orange)](docs/RBI_COMPLIANCE.md)
 [![Security: Google Cloud Model Armor](https://img.shields.io/badge/Security-Google%20Cloud%20Model%20Armor-red)](GCP/MODEL_ARMOR_SETUP.md)
-[![Test Suite: 100% Pass](https://img.shields.io/badge/Tests-66%2F66%20Passing-brightgreen)](tests/run_all_tests.py)
+[![Test Suite: 100% Pass](https://img.shields.io/badge/Tests-68%2F68%20Passing-brightgreen)](tests/run_all_tests.py)
 
 Governance, Risk, and Compliance (GRC) plugin for Google Antigravity providing real-time Indian PII regex/checksum protection and Google Cloud Model Armor safety filtering for Financial Services Institutions.
 
@@ -61,10 +61,10 @@ nandi/
 │   ├── generated_model_armor_template.json  # Standalone REST API payload
 │   └── MODEL_ARMOR_SETUP.md                 # Regional endpoint & IAM setup reference
 │
-├── tests/                                   # Automated test suite (66 test suites, 100% pass)
+├── tests/                                   # Automated test suite (100% pass)
 │   ├── run_all_tests.py                     # Master test runner
 │   ├── test_checksums.py                    # Verhoeff, Luhn, Mod-36, UPI, IFSC validators
-│   ├── test_file_guard.py                   # File slice streaming, Git trust, and cache tests
+│   ├── test_file_guard.py                   # Paged UTF-8 slicing, notebook views, media gate, and LRU cache tests
 │   ├── test_model_armor.py                  # Model Armor client, template CRUD, and IAM tests
 │   ├── test_hooks.py                        # Lifecycle hook interception & fail-closed gates
 │   ├── test_governance.py                   # Cryptographic audit hash chains & compliance maps
@@ -114,26 +114,16 @@ nandi/
 - Interactive skills: [`AGY-Plugin/skills/fsi-compliance-audit`](AGY-Plugin/skills/fsi-compliance-audit), [`AGY-Plugin/skills/model-armor-diagnostics`](AGY-Plugin/skills/model-armor-diagnostics).
 - CLI Tool: [`AGY-Plugin/src/cli/grc_admin.py`](AGY-Plugin/src/cli/grc_admin.py).
 
-### 5. Workspace & External File Content Scanning (`file_scanning` in `config/config.yaml`)
-- **Master Switch (`enabled`)**: `true` *(Default)* or `false` to enable or disable file content reading (when `false`, hooks still scan literal prompt strings and tool arguments).
-- **Scan Modes (`mode`)**:
-  - `prompt_only` *(Recommended Default)*: Scans only files explicitly referenced in the user's prompt (during `PreInvocation`) and subsequent `PreToolUse` reads or directory searches covering those same prompt-referenced files; skips autonomous reads of other files.
-  - `untrusted_and_prompt`: Scans files explicitly referenced in user prompts, files residing outside `workspacePaths`, and Git-untracked, modified, or ignored files (including directory-targeted `grep_search` and `grep`/`rg` shell searches); skips clean committed Git-tracked workspace code during autonomous exploration.
-  - `all`: Scans every file read by a tool or referenced in a prompt, including clean Git-tracked code.
-- **Slicing, Unpaginated Scan Modes & State TTL**:
-  - **Paged reads (`read_file`, `view_file`)**: Stream up to 800 lines and 46,080 bytes per view on files up to 100 MiB (`MAX_PAGED_FILE_SIZE_BYTES`) with 128-byte UTF-8 boundary overlap.
-  - **Unpaginated reads (`grep_search`, `notebook_edit`, `run_command` file readers)**: Enforce `max_file_size_bytes` cap (clamped to `[46080, 4194304]`) with `oversize_action` (`"TRUNCATE"` *(Default)* for 45 KiB head+tail window or `"BLOCK"` to fail-closed) and `unpaged_scan_mode`:
-    - `"single"` *(Default)*: Sends the extracted file text in a single inspection call without client-side chunking.
-    - `"chunk"`: Splits unpaginated payloads exceeding 46,080 bytes into 46,080-byte UTF-8 windows (with 128-byte overlap) for Model Armor evaluation.
-    - `"block"`: Rejects unpaginated reads exceeding 46,080 bytes and instructs the agent to use `read_file` with `StartLine`/`EndLine` pagination.
-  - **Conversation State & Cache TTL (`state_ttl_seconds`)**: Retains per-conversation `prompt_files` attribution and clean-slice cache records (`(real_path, mtime_ns, size, byte_range)`) for `86400` seconds (24 hours, clamped to `[300, 604800]`), while transient turn-block flags expire after 300 seconds.
-- **Environment Variable Overrides** *(Precedence: Environment Variable > `config.yaml` > Built-in Default)*:
-  - `NANDI_FILE_SCAN_ENABLED`: `"true"` | `"false"` (overrides `enabled`)
-  - `NANDI_FILE_SCAN_MODE`: `"prompt_only"` | `"untrusted_and_prompt"` | `"all"`
-  - `NANDI_FILE_SCAN_MAX_BYTES` / `NANDI_MAX_FILE_SIZE_BYTES`: integer bytes cap for unpaginated reads
-  - `NANDI_FILE_SCAN_OVERSIZE_ACTION` / `NANDI_OVERSIZE_FILE_ACTION`: `"TRUNCATE"` | `"BLOCK"`
-  - `NANDI_FILE_SCAN_UNPAGED_MODE`: `"single"` | `"chunk"` | `"block"` (overrides `unpaged_scan_mode`)
-  - `NANDI_STATE_TTL_SECONDS` / `NANDI_FILE_SCAN_STATE_TTL_SECONDS`: integer seconds `[300, 604800]` (overrides `state_ttl_seconds`)
+### 5. Pre-Read File Slice & Multimodal Media Inspection (`hooks` & `payload` in `config/config.yaml`)
+- **Pre-Read Inspection Switch (`hooks.pre_read_scan`)**: `true` *(Default)* or `false`. When `true`, `PreToolUse` unconditionally pre-reads every targeted slice across `read_file`, `view_file` (including nested `TextOptions`), and `notebook_edit` (`list`, `get`, `get_with_outputs` up to 10 MiB) alongside all string/numeric fields in `toolCall.args`. `file://` URIs are decoded automatically.
+- **Unscannable Multimodal Binary Policy (`payload.on_unscannable_media`)**:
+  - `"BLOCK"` *(Default)*: Denies binary multimodal media (`image/*` except `image/svg+xml`, `audio/*`, `video/*`, `application/pdf`, Office/OpenDocument formats, binary `outputs[].data` in `notebook_edit`, and binary `USER_INPUT.media` attachments in `PreInvocation`). `text/*` and `image/svg+xml` attachments are verified as NUL-free UTF-8 and scanned as text; non-media binaries (such as NUL/UTF-16 files, archives, and executables) are skipped so the host tool handles binary rejection natively.
+  - `"ALLOW"`: Permits unscannable binary media without blocking while continuing to inspect scannable UTF-8 text and tool arguments.
+- **Bounded Slicing, Parallel Multi-Chunk Inspection & Content-Addressed Cache**:
+  - **Paged reads (`read_file`, `view_file`)**: Stream up to 800 lines and 46,080 bytes per view (files up to 100 MiB) in 64 KiB UTF-8-aligned blocks with 512-byte backward boundary overlap on paginated byte offsets and a 49,152-byte single-RPC ceiling.
+  - **Notebook & prompt payloads**: Enforce a 250,000-character pre-read scan cap; payloads exceeding 49,152 UTF-8 bytes are split into 40,000-character chunks with 4,096-character overlap and evaluated across up to 4 daemon worker threads under a 24-second wall-clock deadline (`30`s hook timeout in `hooks.json`).
+  - **`PreInvocation` transcript & media handling**: Inspects the user's prompt text (resolving `transcript_full.jsonl` when `transcript.jsonl` truncates long inputs) and `USER_INPUT.media` without speculative `@file` disk reads; `@`-referenced files are inspected in `PreToolUse` when read by the agent.
+  - **Clean-Scan LRU Cache**: Caches zero-finding (`is_clean`) verdicts in `~/.gemini/nandi/state/nandi_read_cache.json` (`0o700`, overridable via `NANDI_STATE_DIR`) keyed by `<guard>:<config_sha256>:<content_sha256>` (incorporating `enforcement_mode`, policy configs, and Model Armor target settings) with a strict 7,200-second (2-hour) non-sliding TTL and 2,000-entry LRU bound.
 
 </details>
 
@@ -314,7 +304,7 @@ python3 AGY-Plugin/src/cli/grc_admin.py show-audit --tail 10
 ```bash
 python3 tests/run_all_tests.py
 ```
-Executes all 66 test suites covering Verhoeff D5, Luhn, Mod-36, Model Armor REP connectivity, fail-closed policy gates, OS-specific packaging, and cryptographic audit hash chains (100% pass rate).
+Executes all 68 test suites covering Verhoeff D5, Luhn, Mod-36, Model Armor REP connectivity, fail-closed policy gates, OS-specific packaging, and cryptographic audit hash chains (100% pass rate).
 
 </details>
 

@@ -1,16 +1,18 @@
 """Google Cloud Model Armor REST Client with ADC Auth & Retry Logic."""
 
+import contextlib
 import dataclasses
 import json
 import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, Optional
 
 
 @dataclasses.dataclass
@@ -87,6 +89,29 @@ class ModelArmorClient:
 
     _auth_attempted: bool = False
     _cached_token: Optional[str] = None
+    _auth_lock: threading.Lock = threading.Lock()
+    _request_ctx: threading.local = threading.local()
+
+    @classmethod
+    @contextlib.contextmanager
+    def deadline_scope(cls, deadline_monotonic: float) -> Iterator[None]:
+        """Bounds per-thread socket timeouts and retry loops to `deadline_monotonic`."""
+        prev = getattr(cls._request_ctx, "deadline_monotonic", None)
+        cls._request_ctx.deadline_monotonic = deadline_monotonic
+        try:
+            yield
+        finally:
+            cls._request_ctx.deadline_monotonic = prev
+
+    def _effective_socket_timeout(self) -> Optional[float]:
+        """Returns remaining socket timeout in seconds, or None if deadline passed."""
+        deadline = getattr(ModelArmorClient._request_ctx, "deadline_monotonic", None)
+        if deadline is None:
+            return float(self.timeout_seconds)
+        remaining = float(deadline) - time.monotonic()
+        if remaining <= 0.0:
+            return None
+        return min(float(self.timeout_seconds), max(0.05, remaining))
 
     def __init__(
         self,
@@ -129,10 +154,16 @@ class ModelArmorClient:
         self.retry_attempts = retry_attempts
 
     def _get_auth_token(self) -> Optional[str]:
-        """Retrieves GCP OAuth2 access token via environment, token file, google-auth ADC, or gcloud."""
+        """Retrieves GCP OAuth2 access token under a process-wide lock."""
         if os.environ.get("MODEL_ARMOR_NO_AUTH") == "1":
             return None
+        if ModelArmorClient._auth_attempted:
+            return ModelArmorClient._cached_token
+        with ModelArmorClient._auth_lock:
+            return self._resolve_auth_token_locked()
 
+    def _resolve_auth_token_locked(self) -> Optional[str]:
+        """Resolves OAuth2 access token while holding `_auth_lock`."""
         if ModelArmorClient._auth_attempted:
             return ModelArmorClient._cached_token
 
@@ -290,9 +321,13 @@ class ModelArmorClient:
 
         last_error = None
         for attempt in range(self.retry_attempts + 1):
+            sock_timeout = self._effective_socket_timeout()
+            if sock_timeout is None:
+                last_error = "Model Armor wall-clock deadline exceeded"
+                break
             try:
                 http_req = urllib.request.Request(url, data=payload_bytes, headers=headers, method="POST")
-                with urllib.request.urlopen(http_req, timeout=self.timeout_seconds) as resp:
+                with urllib.request.urlopen(http_req, timeout=sock_timeout) as resp:
                     resp_body = resp.read().decode("utf-8")
                     data = json.loads(resp_body)
                     elapsed_ms = (time.perf_counter() - start_time) * 1000.0
@@ -318,7 +353,14 @@ class ModelArmorClient:
             except Exception as e:
                 last_error = str(e)
 
-            time.sleep(0.1 * (2 ** attempt))
+            if attempt >= self.retry_attempts:
+                break
+            backoff = 0.1 * (2 ** attempt)
+            deadline = getattr(ModelArmorClient._request_ctx, "deadline_monotonic", None)
+            if deadline is not None and (time.monotonic() + backoff) >= float(deadline):
+                last_error = last_error or "Model Armor wall-clock deadline exceeded"
+                break
+            time.sleep(backoff)
 
         # Fail-closed: if live Model Armor call fails, return failure response so prompt is blocked
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0

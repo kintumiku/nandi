@@ -39,6 +39,7 @@ class ModelArmorEvaluationReport:
     rbi_compliance_codes: List[str]
     sebi_compliance_codes: List[str]
     latency_ms: float
+    is_clean: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -51,6 +52,7 @@ class ModelArmorEvaluationReport:
             "rbi_compliance_codes": self.rbi_compliance_codes,
             "sebi_compliance_codes": self.sebi_compliance_codes,
             "latency_ms": self.latency_ms,
+            "is_clean": self.is_clean,
         }
 
 
@@ -180,6 +182,7 @@ class ModelArmorPolicyEvaluator:
         has_violations = len(violations) > 0 or response.filter_match_state == "MATCH_FOUND"
 
         if has_violations:
+            is_clean = False
             if self.action_on_match == "BLOCK":
                 decision = "deny"
                 is_allowed = False
@@ -195,6 +198,7 @@ class ModelArmorPolicyEvaluator:
                 f"Regulatory Mandates Triggered: {', '.join(sorted(set(rbi_codes + sebi_codes)))}. Risk Score: {round(risk_score, 2)}."
             )
         else:
+            is_clean = response.invocation_result == "SUCCESS"
             decision = "allow"
             is_allowed = True
             reason = "Model Armor Security Gate Passed: No adversarial, toxic, or malicious indicators found."
@@ -209,4 +213,5 @@ class ModelArmorPolicyEvaluator:
             rbi_compliance_codes=sorted(list(set(rbi_codes))),
             sebi_compliance_codes=sorted(list(set(sebi_codes))),
             latency_ms=response.latency_ms,
+            is_clean=is_clean,
         )

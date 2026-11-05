@@ -29,6 +29,7 @@ nandi/
 │   ├── logs/                   # Local tamper-evident audit logs (fsi_audit.log)
 │   └── src/                    # Core Python engine (zero mandatory external dependencies)
 │       ├── cli/                # Admin CLI (grc_admin.py)
+│       ├── file_guard/         # Pre-read file slice, notebook cell, and multimodal media scanner
 │       ├── governance/         # Audit logger, RBI & SEBI compliance controllers
 │       ├── hooks/              # Antigravity lifecycle hook executables
 │       ├── model_armor/        # Model Armor REST client and policy evaluator
@@ -42,7 +43,7 @@ nandi/
 │   ├── terraform/              # Production Terraform templates (Model Armor, DLP, Logging)
 │   ├── generated_model_armor_template.json # Standalone REST API payload
 │   └── MODEL_ARMOR_SETUP.md    # GCP deployment and IAM guide
-├── tests/                      # 40 automated unit and end-to-end test suites
+├── tests/                      # 68 automated unit and end-to-end test suites
 └── docs/                       # Complete compliance & architectural documentation
 ```
 

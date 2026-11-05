@@ -68,7 +68,10 @@ def main() -> None:
             hook.reply_deny(deny_reason)
             return
 
-        hook.reply_allow("Clean: No sensitive Indian PII detected")
+        hook.reply_allow(
+            "Clean: No sensitive Indian PII detected",
+            is_clean=not report.contains_pii,
+        )
         return
 
     # 3. PreInvocation Handling
@@ -103,7 +106,7 @@ def main() -> None:
         hook.reply_block_pre_invocation(deny_reason)
         return
 
-    hook.reply_pre_invocation()
+    hook.reply_pre_invocation(is_clean=not report.contains_pii)
 
 
 if __name__ == "__main__":

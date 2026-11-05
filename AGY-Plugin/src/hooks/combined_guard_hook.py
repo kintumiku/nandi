@@ -93,7 +93,13 @@ def main() -> None:
                 hook.reply_deny(deny_reason)
             return
 
-        hook.reply_allow("All FSI GRC Security & Safety Gates Passed")
+        hook.reply_allow(
+            "All FSI GRC Security & Safety Gates Passed",
+            is_clean=(
+                not pii_report.contains_pii
+                and bool(getattr(eval_report, "is_clean", False))
+            ),
+        )
         return
 
     # 3. PreInvocation Handling
@@ -149,7 +155,12 @@ def main() -> None:
         hook.reply_block_pre_invocation(deny_reason)
         return
 
-    hook.reply_pre_invocation()
+    hook.reply_pre_invocation(
+        is_clean=(
+            not pii_report.contains_pii
+            and bool(getattr(eval_report, "is_clean", False))
+        )
+    )
 
 
 if __name__ == "__main__":

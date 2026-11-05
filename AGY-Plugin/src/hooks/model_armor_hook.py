@@ -71,7 +71,10 @@ def main() -> None:
                 hook.reply_deny(deny_reason)
             return
 
-        hook.reply_allow(eval_report.reason)
+        hook.reply_allow(
+            eval_report.reason,
+            is_clean=bool(getattr(eval_report, "is_clean", False)),
+        )
         return
 
     # 3. PreInvocation Handling
@@ -104,7 +107,9 @@ def main() -> None:
         hook.reply_block_pre_invocation(deny_reason)
         return
 
-    hook.reply_pre_invocation()
+    hook.reply_pre_invocation(
+        is_clean=bool(getattr(eval_report, "is_clean", False))
+    )
 
 
 if __name__ == "__main__":
