@@ -6,7 +6,7 @@
 [![Compliance: SEBI CSCRF 2024](https://img.shields.io/badge/Compliance-SEBI%20CSCRF%202024-green)](docs/SEBI_COMPLIANCE.md)
 [![Compliance: DPDP Act 2023](https://img.shields.io/badge/Compliance-DPDP%20Act%202023-orange)](docs/RBI_COMPLIANCE.md)
 [![Security: Google Cloud Model Armor](https://img.shields.io/badge/Security-Google%20Cloud%20Model%20Armor-red)](GCP/MODEL_ARMOR_SETUP.md)
-[![Test Suite: 100% Pass](https://img.shields.io/badge/Tests-68%2F68%20Passing-brightgreen)](tests/run_all_tests.py)
+[![Test Suite: 100% Pass](https://img.shields.io/badge/Tests-69%2F69%20Passing-brightgreen)](tests/run_all_tests.py)
 
 Governance, Risk, and Compliance (GRC) plugin for Google Antigravity providing real-time Indian PII regex/checksum protection and Google Cloud Model Armor safety filtering for Financial Services Institutions.
 
@@ -304,7 +304,7 @@ python3 AGY-Plugin/src/cli/grc_admin.py show-audit --tail 10
 ```bash
 python3 tests/run_all_tests.py
 ```
-Executes all 68 test suites covering Verhoeff D5, Luhn, Mod-36, Model Armor REP connectivity, fail-closed policy gates, OS-specific packaging, and cryptographic audit hash chains (100% pass rate).
+Executes all 69 test suites covering Verhoeff D5, Luhn, Mod-36, Model Armor REP connectivity, fail-closed policy gates, OS-specific packaging, and cryptographic audit hash chains (100% pass rate).
 
 </details>
 

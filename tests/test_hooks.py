@@ -1474,6 +1474,70 @@ class TestHooks(unittest.TestCase):
         cached_sa = sa_hook.extract_scan_target()
         self.assertEqual(cached_sa.action, "SKIP_CACHED")
 
+    def test_block_policy_emits_hash_chained_audit_log_across_all_hooks(self) -> None:
+        png_path = os.path.join(self._tmp_dir, "blocked_chart.png")
+        with open(png_path, "wb") as fh:
+            fh.write(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+
+        expected_hooks = [
+            (pii_hook_main, "fsi-pii-guard"),
+            (model_armor_main, "fsi-model-armor-guard"),
+            (combined_guard_main, "fsi-unified-guard"),
+        ]
+        for idx, (main_fn, expected_name) in enumerate(expected_hooks):
+            # 1. PreToolUse BLOCK_POLICY (unscannable PNG binary)
+            tool_out = self._run_inproc_hook(
+                main_fn,
+                {
+                    "conversationId": f"conv-audit-tool-{idx}",
+                    "stepIdx": idx + 1,
+                    "toolCall": {"name": "read_file", "args": {"Path": png_path}},
+                },
+            )
+            self.assertEqual(tool_out.get("decision"), "deny")
+
+            # 2. PreInvocation BLOCK_POLICY (unscannable PNG prompt attachment)
+            pre_out = self._run_inproc_hook(
+                main_fn,
+                {
+                    "conversationId": f"conv-audit-pre-{idx}",
+                    "invocationNum": 0,
+                    "media": [{"mime_type": "image/png", "uri": png_path}],
+                },
+            )
+            self.assertIn("injectSteps", pre_out)
+
+        with open(self._audit_log_path, "r", encoding="utf-8") as fh:
+            records = [json.loads(line) for line in fh if line.strip()]
+
+        self.assertEqual(len(records), 6)
+        expected_prev = "GENESIS_BLOCK_FSI_INDIA_0000000000000000"
+        for idx, (_, expected_name) in enumerate(expected_hooks):
+            rec_tool = records[2 * idx]
+            rec_pre = records[2 * idx + 1]
+
+            self.assertEqual(rec_tool["hook_name"], expected_name)
+            self.assertEqual(rec_tool["event_type"], "PRE_TOOL_USE")
+            self.assertEqual(rec_tool["decision"], "deny")
+            self.assertEqual(rec_tool["conversation_id"], f"conv-audit-tool-{idx}")
+            self.assertEqual(
+                rec_tool["detected_violations"], ["tool_unscannable_media:read_file"]
+            )
+            self.assertEqual(rec_tool["caller_metadata"]["tool_name"], "read_file")
+            self.assertEqual(rec_tool["prev_event_hash"], expected_prev)
+            self.assertEqual(len(rec_tool["event_hash"]), 64)
+
+            self.assertEqual(rec_pre["hook_name"], expected_name)
+            self.assertEqual(rec_pre["event_type"], "PRE_INVOCATION")
+            self.assertEqual(rec_pre["decision"], "deny")
+            self.assertEqual(rec_pre["conversation_id"], f"conv-audit-pre-{idx}")
+            self.assertEqual(
+                rec_pre["detected_violations"], ["payload:media:media_block"]
+            )
+            self.assertEqual(rec_pre["prev_event_hash"], rec_tool["event_hash"])
+            self.assertEqual(len(rec_pre["event_hash"]), 64)
+            expected_prev = rec_pre["event_hash"]
+
 
 if __name__ == "__main__":
     unittest.main()

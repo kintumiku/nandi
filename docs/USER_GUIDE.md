@@ -43,7 +43,7 @@ nandi/
 │   ├── terraform/              # Production Terraform templates (Model Armor, DLP, Logging)
 │   ├── generated_model_armor_template.json # Standalone REST API payload
 │   └── MODEL_ARMOR_SETUP.md    # GCP deployment and IAM guide
-├── tests/                      # 68 automated unit and end-to-end test suites
+├── tests/                      # 69 automated unit and end-to-end test suites
 └── docs/                       # Complete compliance & architectural documentation
 ```
 
