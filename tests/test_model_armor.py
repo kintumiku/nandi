@@ -15,10 +15,15 @@ if plugin_root not in sys.path:
 if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
+from src.cli import refresh_adc_token
 from src.model_armor import client as ma_client_module
 from src.model_armor.client import ModelArmorClient
 from src.model_armor.client import TOKEN_FILE_MAX_AGE_SECONDS
 from src.model_armor.policy_evaluator import ModelArmorPolicyEvaluator
+
+
+def _record_refresh_timeout(captured_timeouts, req_callable):
+    captured_timeouts.append(req_callable.keywords.get("timeout"))
 
 
 def _urlopen_capture_clean(captured_payloads, req, timeout=5.0):
@@ -406,6 +411,33 @@ class TestModelArmor(unittest.TestCase):
             fallback_parsed = ma_client_module.load_model_armor_config(cfg_path)
             self.assertNotIn("token_file", fallback_parsed)
             self.assertEqual(fallback_parsed.get("location"), "asia-south2")
+
+    def test_refresh_adc_token_cli(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tok_out = os.path.join(tmp_dir, "cache", "access_token")
+            fake_creds = MagicMock()
+            fake_creds.token = "cli-refreshed-token\n"
+            captured_timeouts = []
+            fake_creds.refresh.side_effect = functools.partial(_record_refresh_timeout, captured_timeouts)
+            fake_google_auth = MagicMock()
+            fake_google_auth.default.return_value = (fake_creds, "proj")
+            fake_requests_mod = MagicMock()
+
+            with patch.object(refresh_adc_token, "google_auth", fake_google_auth), patch.object(
+                refresh_adc_token, "google_auth_requests", fake_requests_mod
+            ):
+                rc = refresh_adc_token.main(["refresh_adc_token.py", "/tmp/cred.json", tok_out, "12.5"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(captured_timeouts, [12.5])
+            with open(tok_out, "r", encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "cli-refreshed-token")
+
+            fake_certifi = MagicMock()
+            fake_certifi.where.return_value = "/etc/ssl/certifi.pem"
+            with patch.object(refresh_adc_token, "certifi", fake_certifi), patch("sys.stdout.write") as mock_write:
+                self.assertEqual(refresh_adc_token.main(["refresh_adc_token.py", "--print-certifi"]), 0)
+            mock_write.assert_called_once_with("/etc/ssl/certifi.pem\n")
+            self.assertEqual(refresh_adc_token.main(["refresh_adc_token.py"]), 2)
 
 
 if __name__ == "__main__":
