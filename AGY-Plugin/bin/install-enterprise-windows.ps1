@@ -9,6 +9,9 @@ param(
 
     [Parameter(Mandatory = $true)]
     [string]$ProjectId,
+    [string]$ProjectNumber = "",
+    [string]$IdpTokenExecutable = "",
+    [string]$IdpTokenFile = "",
 
     [string]$Location = "asia-south1",
     [string]$TemplateId = "Nandi-compliance-template",

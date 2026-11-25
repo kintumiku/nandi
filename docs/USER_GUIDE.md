@@ -97,6 +97,8 @@ For zero-touch enterprise rollouts on Windows laptops without developer-side ins
    .\AGY-Plugin\bin\build-offline-bundle.ps1 -OutputDir .\nandi-mdm-bundle
    ```
 
+   - **Architecture 1 (`-AuthMode WorkforceOIDC`)**: Workforce Identity Federation via silent corporate SSO (`S-1-5-4` user-session refresh task via `sync-user-nandi.ps1` writing `%LOCALAPPDATA%\Nandi\cache\access_token`). Stages `get-idp-oidc-token.ps1` under `C:\ProgramData\Nandi\bin` by default; pass `-IdpTokenFile` or `-IdpTokenExecutable` when an existing company SSO agent provides tokens directly.
+
 2. **Corporate TLS Inspection Proxy Root CA**:
    - By default, `install-enterprise-windows.ps1` merges `Cert:\LocalMachine\Root` with `certifi` into `C:\ProgramData\Nandi\certs\combined-ca-bundle.pem` and sets `caCertPath`, `REQUESTS_CA_BUNDLE`, and `SSL_CERT_FILE`.
    - Pass `-CustomCaPemPath .\corp-root-ca.pem` to merge an explicit Root CA PEM file instead.
