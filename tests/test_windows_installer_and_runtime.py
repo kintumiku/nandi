@@ -28,6 +28,7 @@ if plugin_root not in sys.path:
   sys.path.insert(0, plugin_root)
 
 from src.hooks.hook_base import AntigravityHookBase
+from src.model_armor import client as ma_client_module
 from src.model_armor.client import ModelArmorClient
 
 
@@ -171,10 +172,15 @@ class TestWindowsInstallerAndRuntime(unittest.TestCase):
        the future, the script body contains zero non-ASCII bytes (`>= 0x80`),
        so `cp1252` decoding can never synthesize smart quotes (`0x93`/`0x94`).
     """
-    ps1_files = [
-        os.path.join(repo_root, "AGY-Plugin", "bin", "install-nandi.ps1"),
-        os.path.join(repo_root, "GCP", "bin", "setup-model-armor.ps1"),
-    ]
+    ps1_files = []
+    for search_root in (
+        os.path.join(repo_root, "AGY-Plugin", "bin"),
+        os.path.join(repo_root, "GCP", "bin"),
+    ):
+      for dirpath, _, filenames in os.walk(search_root):
+        for fn in sorted(filenames):
+          if fn.endswith(".ps1"):
+            ps1_files.append(os.path.join(dirpath, fn))
     for path in ps1_files:
       with open(path, "rb") as f:
         raw = f.read()
@@ -509,10 +515,37 @@ class TestWindowsInstallerAndRuntime(unittest.TestCase):
           "GOOGLE_APPLICATION_CREDENTIALS": adc_file,
       }
       with patch.dict(os.environ, env_overrides, clear=False):
-        with patch.dict(sys.modules, {"google": None, "google.auth": None}):
+        with patch.object(ma_client_module, "google_auth", None), patch.object(
+            ma_client_module, "google_auth_requests", None
+        ):
           with patch("urllib.request.urlopen", return_value=fake_resp):
             token = client._get_auth_token()
             self.assertEqual(token, "mock-stdlib-refreshed-token")
+
+  def test_shared_user_sync_and_offline_bundler_chassis(self):
+    bin_dir = os.path.join(repo_root, "AGY-Plugin", "bin")
+    with open(os.path.join(bin_dir, "sync-user-nandi.ps1"), "r", encoding="utf-8-sig") as f:
+      sync_text = f.read()
+    with open(os.path.join(bin_dir, "build-offline-bundle.ps1"), "r", encoding="utf-8-sig") as f:
+      bundle_text = f.read()
+
+    sync_non_comment = "\n".join(
+        line for line in sync_text.splitlines() if not line.lstrip().startswith("#")
+    )
+    self.assertIn("UTF8Encoding($false)", sync_text)
+    self.assertIn("FSI_AUDIT_LOG_PATH", sync_text)
+    self.assertIn("[System.UnauthorizedAccessException]", sync_text)
+    self.assertNotIn("SetEnvironmentVariable(", sync_non_comment)
+    self.assertIn("0x0002", sync_non_comment)
+    self.assertNotIn("$env:TEMP", sync_text)
+    self.assertIn("refresh_adc_token.py", sync_text)
+    self.assertIn("channels\\sync-$ModeSlug.ps1", sync_text)
+
+    self.assertIn('@(".venv", "logs")', bundle_text)
+    self.assertIn('"__pycache__"', bundle_text)
+    self.assertIn("StartsWith($FullPluginRoot", bundle_text)
+    self.assertNotIn("csc.exe", bundle_text)
+    self.assertNotIn("CompileHelpers", bundle_text)
 
 
 if __name__ == "__main__":
