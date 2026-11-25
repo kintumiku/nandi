@@ -18,6 +18,11 @@ param(
     [ValidateSet("fsi-model-armor-guard", "fsi-unified-guard")]
     [string]$GuardProfile = "fsi-model-armor-guard",
     [string]$CustomCaPemPath = "",
+    [string]$WorkloadAudience = "",
+    [string]$ServiceAccountEmail = "",
+    [string]$CertThumbprint = "",
+    [string]$MachineCertPath = "",
+    [string]$MachineKeyPath = "",
     [switch]$EnableGranularGeminiAcls
 )
 

@@ -103,5 +103,9 @@ For zero-touch enterprise rollouts on Windows laptops without developer-side ins
    - By default, `install-enterprise-windows.ps1` merges `Cert:\LocalMachine\Root` with `certifi` into `C:\ProgramData\Nandi\certs\combined-ca-bundle.pem` and sets `caCertPath`, `REQUESTS_CA_BUNDLE`, and `SSL_CERT_FILE`.
    - Pass `-CustomCaPemPath .\corp-root-ca.pem` to merge an explicit Root CA PEM file instead.
 
-3. **Deploy as `SYSTEM` via Intune or SCCM** using `install-enterprise-windows.ps1` with one of the installed credential channels below.
+3. **Deploy as `SYSTEM` via Intune or SCCM** using `install-enterprise-windows.ps1` with one of the installed credential channels:
+   - **Architecture 2, Option 2A (`-AuthMode WorkloadX509 -ServiceAccountEmail <sa>`)**: Machine X.509 certificate + service account impersonation (`NT AUTHORITY\SYSTEM` refresh task via `refresh-mtls-system.ps1` writing `C:\ProgramData\Nandi\cache\access_token`). Uses `Cert:\LocalMachine\My` natively via `mtls-sts-common.ps1` by default, or pass `-MachineCertPath` and `-MachineKeyPath` (outside `C:\ProgramData\Nandi` and `C:\Program Files\Nandi`) for PEM mode.
+   - **Architecture 2, Option 2B (`-AuthMode WorkloadX509`, omitting `-ServiceAccountEmail`)**: Direct per-user X.509 Workload Identity Federation against `Cert:\CurrentUser\My` (`S-1-5-4` user-session task via `sync-user-nandi.ps1 -AuthMode WorkloadX509User` writing `%LOCALAPPDATA%\Nandi\cache\access_token`).
+   - Architecture 2 requires `-WorkloadAudience` (and `-IssuingCaCert .\corp-pki-issuing.crt` when staging `inter.crt` in `build-offline-bundle.ps1`).
+
 

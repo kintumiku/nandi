@@ -5,6 +5,7 @@ param(
     [string]$Platform = "win_amd64",
     [string]$AntigravityInstaller = "",
     [string]$PythonInstaller = "",
+    [string]$IssuingCaCert = "",
     [string]$CustomCaPemPath = ""
 )
 
@@ -28,6 +29,7 @@ if ($FullOutputDir.Equals($FullPluginRoot, [System.StringComparison]::OrdinalIgn
 $OptionalFiles = New-Object System.Collections.Generic.List[hashtable]
 $OptionalFiles.Add(@{ Name = "-AntigravityInstaller"; Path = $AntigravityInstaller; Dest = "Antigravity-x64.exe" })
 $OptionalFiles.Add(@{ Name = "-PythonInstaller"; Path = $PythonInstaller; Dest = "python-3.12-amd64.exe" })
+$OptionalFiles.Add(@{ Name = "-IssuingCaCert"; Path = $IssuingCaCert; Dest = "inter.crt" })
 $OptionalFiles.Add(@{ Name = "-CustomCaPemPath"; Path = $CustomCaPemPath; Dest = "corp-root-ca.pem" })
 
 foreach ($Entry in $OptionalFiles) {

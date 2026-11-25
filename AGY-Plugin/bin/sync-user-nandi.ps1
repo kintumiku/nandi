@@ -2,7 +2,10 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$AuthMode,
-    [string]$InstallRoot = "C:\Program Files\Nandi"
+    [string]$InstallRoot = "C:\Program Files\Nandi",
+    [string]$WorkloadAudience = "",
+    [string]$CertThumbprint = "",
+    [string]$TrustChainPath = "C:\ProgramData\Nandi\certs\inter.crt"
 )
 
 $ErrorActionPreference = "Stop"
