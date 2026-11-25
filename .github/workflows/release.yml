@@ -35,6 +35,9 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Run Automated Test Suite
+        run: python3 tests/run_all_tests.py
+
       - name: Set Release Version
         id: vars
         run: |
@@ -54,6 +57,7 @@ jobs:
           mkdir -p staging/darwin
           mkdir -p staging/windows
           mkdir -p staging/universal
+          mkdir -p staging/enterprise
           mkdir -p dist
 
       # ========================================================================
@@ -273,6 +277,34 @@ jobs:
           ```
           SUBEOF
 
+          # --------------------------------------------------------------------
+          # 1.5 Enterprise Windows MDM (Intune / SCCM Fleet Rollout)
+          # --------------------------------------------------------------------
+          ENT_WIN="staging/enterprise/nandi-enterprise-mdm-windows"
+          stage_client_base "${ENT_WIN}/AGY-Plugin"
+          cp -p README.md "${ENT_WIN}/"
+          cp -p "${CLIENT_WINDOWS}/hooks.json" "${ENT_WIN}/AGY-Plugin/hooks.json"
+          mkdir -p "${ENT_WIN}/AGY-Plugin/bin"
+          for ps1 in AGY-Plugin/bin/*.ps1; do
+            case "$(basename "${ps1}")" in
+              install-nandi.*) continue ;;
+            esac
+            cp -p "${ps1}" "${ENT_WIN}/AGY-Plugin/bin/"
+          done
+          [ -d AGY-Plugin/bin/channels ] && cp -rp AGY-Plugin/bin/channels "${ENT_WIN}/AGY-Plugin/bin/" || true
+
+          cat << 'SUBEOF' > "${ENT_WIN}/QUICKSTART.md"
+          # Nandi-Enterprise-MDM (Windows Intune / SCCM) Quickstart
+
+          This package contains the enterprise Windows MDM offline bundle builder, `SYSTEM` installer, and background token refresh scripts for zero-touch fleet rollouts.
+
+          ```powershell
+          Expand-Archive -Path nandi-enterprise-mdm-windows.zip -DestinationPath .
+          cd nandi-enterprise-mdm-windows
+          .\AGY-Plugin\bin\build-offline-bundle.ps1 -OutputDir .\nandi-mdm-bundle
+          ```
+          SUBEOF
+
       - name: Archive Nandi-Client Packages
         run: |
           # Linux
@@ -293,8 +325,12 @@ jobs:
           tar -czf dist/nandi-client.tar.gz -C staging/universal nandi-client
           (cd staging/universal && zip -rq ../../dist/nandi-client.zip nandi-client)
 
+          # Enterprise Windows MDM
+          tar -czf dist/nandi-enterprise-mdm-windows.tar.gz -C staging/enterprise nandi-enterprise-mdm-windows
+          (cd staging/enterprise && zip -rq ../../dist/nandi-enterprise-mdm-windows.zip nandi-enterprise-mdm-windows)
+
           echo "Nandi-Client packages staged successfully:"
-          ls -lh dist/nandi-client*
+          ls -lh dist/nandi-client* dist/nandi-enterprise-mdm-windows*
 
       # ========================================================================
       # 2. Package Nandi-Server (GCP Terraform & Model Armor Provisioning)
@@ -525,6 +561,15 @@ jobs:
             dist/nandi-client-windows.zip
           retention-days: 90
 
+      - name: Upload Nandi-Enterprise-MDM Windows Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nandi-enterprise-mdm-windows
+          path: |
+            dist/nandi-enterprise-mdm-windows.tar.gz
+            dist/nandi-enterprise-mdm-windows.zip
+          retention-days: 90
+
       - name: Upload Nandi-Server Linux Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -593,6 +638,15 @@ jobs:
             | 🍎 **macOS** | [`nandi-client-darwin.tar.gz`](https://github.com/${{ github.repository }}/releases/download/${{ steps.vars.outputs.VERSION }}/nandi-client-darwin.tar.gz) · [`zip`](https://github.com/${{ github.repository }}/releases/download/${{ steps.vars.outputs.VERSION }}/nandi-client-darwin.zip) | `tar -xzf nandi-client-darwin.tar.gz && cd nandi-client && ./bin/install-nandi.sh --project-id <PROJECT_ID>` |
             | 🪟 **Windows** | [`nandi-client-windows.tar.gz`](https://github.com/${{ github.repository }}/releases/download/${{ steps.vars.outputs.VERSION }}/nandi-client-windows.tar.gz) · [`zip`](https://github.com/${{ github.repository }}/releases/download/${{ steps.vars.outputs.VERSION }}/nandi-client-windows.zip) | `tar -xzf nandi-client-windows.tar.gz && cd nandi-client && .\bin\install-nandi.ps1 -ProjectId <PROJECT_ID>` |
             | 🌐 **Universal** | [`nandi-client.tar.gz`](https://github.com/${{ github.repository }}/releases/download/${{ steps.vars.outputs.VERSION }}/nandi-client.tar.gz) · [`zip`](https://github.com/${{ github.repository }}/releases/download/${{ steps.vars.outputs.VERSION }}/nandi-client.zip) | Multi-platform fallback archive |
+
+            ---
+
+            ### 🏢 Nandi-Enterprise-MDM (Windows Intune / SCCM)
+            *For Endpoint Engineering & Enterprise IT Administrators rolling out Nandi across managed Windows fleets.*
+
+            | Platform | Download | Quick Bundle |
+            | :--- | :--- | :--- |
+            | 🪟 **Windows MDM** | [`nandi-enterprise-mdm-windows.zip`](https://github.com/${{ github.repository }}/releases/download/${{ steps.vars.outputs.VERSION }}/nandi-enterprise-mdm-windows.zip) · [`tar.gz`](https://github.com/${{ github.repository }}/releases/download/${{ steps.vars.outputs.VERSION }}/nandi-enterprise-mdm-windows.tar.gz) | `.\AGY-Plugin\bin\build-offline-bundle.ps1 -OutputDir .\nandi-mdm-bundle` |
 
             ---
 

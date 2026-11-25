@@ -82,6 +82,8 @@ class TestPackagingAndWindowsScripts(unittest.TestCase):
         self.assertIn("nandi-client-linux.tar.gz", content)
         self.assertIn("nandi-client-darwin.tar.gz", content)
         self.assertIn("nandi-client-windows.tar.gz", content)
+        self.assertIn("nandi-enterprise-mdm-windows.tar.gz", content)
+        self.assertIn("nandi-enterprise-mdm-windows.zip", content)
         self.assertIn("nandi-server-linux.tar.gz", content)
         self.assertIn("nandi-server-darwin.tar.gz", content)
         self.assertIn("nandi-server-windows.tar.gz", content)
@@ -156,6 +158,31 @@ class TestPackagingAndWindowsScripts(unittest.TestCase):
                 parsed_hooks = json.loads(extracted_hooks.read().decode("utf-8"))
                 pre_inv_cmd = parsed_hooks["fsi-model-armor-guard"]["PreInvocation"][0]["command"]
                 self.assertTrue(pre_inv_cmd.startswith(".venv\\Scripts\\python.exe"))
+                self.assertNotIn("nandi-client/bin/install-enterprise-windows.ps1", names)
+
+            ent_root = os.path.join(staging_dir, "enterprise", "nandi-enterprise-mdm-windows")
+            ent_plugin = os.path.join(ent_root, "AGY-Plugin")
+            os.makedirs(os.path.join(ent_plugin, "bin"))
+            shutil.copy(os.path.join(PLUGIN_ROOT, "plugin.json"), ent_plugin)
+            shutil.copy(os.path.join(windows_client, "hooks.json"), ent_plugin)
+            for fn in os.listdir(os.path.join(PLUGIN_ROOT, "bin")):
+                if fn.endswith(".ps1") and not fn.startswith("install-nandi."):
+                    shutil.copy(os.path.join(PLUGIN_ROOT, "bin", fn), os.path.join(ent_plugin, "bin"))
+            channels_src = os.path.join(PLUGIN_ROOT, "bin", "channels")
+            if os.path.isdir(channels_src):
+                shutil.copytree(channels_src, os.path.join(ent_plugin, "bin", "channels"))
+            ent_zip = os.path.join(dist_dir, "nandi-enterprise-mdm-windows.zip")
+            with zipfile.ZipFile(ent_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+                for dirpath, _, filenames in os.walk(ent_root):
+                    for fn in filenames:
+                        full = os.path.join(dirpath, fn)
+                        rel = os.path.relpath(full, os.path.join(staging_dir, "enterprise")).replace("\\", "/")
+                        zf.write(full, rel)
+            with zipfile.ZipFile(ent_zip, "r") as zf:
+                znames = zf.namelist()
+                self.assertIn("nandi-enterprise-mdm-windows/AGY-Plugin/bin/install-enterprise-windows.ps1", znames)
+                self.assertIn("nandi-enterprise-mdm-windows/AGY-Plugin/bin/build-offline-bundle.ps1", znames)
+                self.assertNotIn("nandi-enterprise-mdm-windows/AGY-Plugin/bin/install-nandi.ps1", znames)
 
 
 if __name__ == "__main__":

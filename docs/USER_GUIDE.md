@@ -85,3 +85,21 @@ Execute the comprehensive test runner:
 ```bash
 python3 tests/run_all_tests.py
 ```
+
+---
+
+## 5. Enterprise Windows MDM Rollout (Intune / SCCM)
+
+For zero-touch enterprise rollouts on Windows laptops without developer-side installation or `gcloud`, download **`nandi-enterprise-mdm-windows.zip`** from the release assets (or use `AGY-Plugin/bin/` from a repository checkout):
+
+1. **Build the offline bundle** on an admin workstation:
+   ```powershell
+   .\AGY-Plugin\bin\build-offline-bundle.ps1 -OutputDir .\nandi-mdm-bundle
+   ```
+
+2. **Corporate TLS Inspection Proxy Root CA**:
+   - By default, `install-enterprise-windows.ps1` merges `Cert:\LocalMachine\Root` with `certifi` into `C:\ProgramData\Nandi\certs\combined-ca-bundle.pem` and sets `caCertPath`, `REQUESTS_CA_BUNDLE`, and `SSL_CERT_FILE`.
+   - Pass `-CustomCaPemPath .\corp-root-ca.pem` to merge an explicit Root CA PEM file instead.
+
+3. **Deploy as `SYSTEM` via Intune or SCCM** using `install-enterprise-windows.ps1` with one of the installed credential channels below.
+

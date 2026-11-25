@@ -331,13 +331,22 @@ Executes all 40 test suites covering Verhoeff D5, Luhn, Mod-36, Model Armor REP 
 ---
 
 <details>
+<summary><strong>Enterprise Windows MDM Rollout (Intune / SCCM)</strong></summary>
+
+For zero-touch Windows fleet deployment without developer-side setup, `AGY-Plugin/bin/` provides `build-offline-bundle.ps1`, `install-enterprise-windows.ps1`, and `sync-user-nandi.ps1` packaged into the dedicated `nandi-enterprise-mdm-windows` release archive. See [Operator & Developer User Guide](docs/USER_GUIDE.md#5-enterprise-windows-mdm-rollout-intune--sccm) for supported credential channels and usage.
+
+</details>
+
+---
+
+<details>
 <summary><strong>CI/CD & Documentation Links</strong></summary>
 
 ### Automated Release Pipeline
 
 GitHub Actions workflow ([`.github/workflows/release.yml`](.github/workflows/release.yml)) automatically builds, validates, and packages:
 - **OS-Specific Packages**: Linux (`.tar.gz`, `.zip`), macOS / Darwin (`.tar.gz`, `.zip`), Windows (`.tar.gz`, `.zip`).
-- **Client & Server Separation**: `nandi-client` and `nandi-server` packaged independently with the consolidated root `README.md`.
+- **Persona-Separated Packages**: `nandi-client` (developers), `nandi-enterprise-mdm-windows` (Endpoint / Intune / SCCM administrators), and `nandi-server` (Cloud / SecOps) packaged independently with the consolidated root `README.md`.
 - **Integrity**: Computes and signs `SHA256SUMS.txt` for all release assets.
 
 ### Documentation References
