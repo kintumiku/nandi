@@ -547,6 +547,73 @@ class TestWindowsInstallerAndRuntime(unittest.TestCase):
     self.assertNotIn("csc.exe", bundle_text)
     self.assertNotIn("CompileHelpers", bundle_text)
 
+  def test_enterprise_installer_chassis_contracts_and_schema(self):
+    install_path = os.path.join(
+        repo_root, "AGY-Plugin", "bin", "install-enterprise-windows.ps1"
+    )
+    with open(install_path, "r", encoding="utf-8-sig") as f:
+      install_text = f.read()
+
+    install_non_comment = "\n".join(
+        line for line in install_text.splitlines() if not line.lstrip().startswith("#")
+    )
+    for sid in ("*S-1-5-18", "*S-1-5-32-544", "*S-1-5-32-545"):
+      self.assertIn(sid, install_text)
+    self.assertIn("UTF8Encoding($false)", install_text)
+    self.assertIn('"/S"', install_text)
+    self.assertNotIn("/VERYSILENT", install_text)
+    self.assertIn("-AllowStartIfOnBatteries", install_non_comment)
+    self.assertIn("-DontStopIfGoingOnBatteries", install_non_comment)
+    self.assertIn("-ExecutionTimeLimit (New-TimeSpan -Minutes 5)", install_non_comment)
+    self.assertNotIn("MaxValue", install_non_comment)
+    self.assertNotIn("-RepetitionDuration", install_non_comment)
+    self.assertNotIn("schtasks", install_non_comment.lower())
+    self.assertIn(r"Cert:\LocalMachine\Root", install_text)
+    self.assertIn("$CustomCaPemPath", install_text)
+    self.assertIn("combined-ca-bundle.pem", install_text)
+    self.assertIn("REQUESTS_CA_BUNDLE", install_text)
+    self.assertIn("SSL_CERT_FILE", install_text)
+    self.assertIn("function Invoke-Icacls", install_text)
+    self.assertIn("*S-1-3-0:(OI)(CI)(IO)F", install_text)
+    self.assertIn("*S-1-5-32-545:(RX,WD,AD)", install_text)
+    self.assertIn('"/deny", "*S-1-5-32-545:(DE)"', install_text)
+    self.assertNotIn("Select-Object -First", install_non_comment)
+    self.assertNotIn("SetEnvironmentVariable(", install_non_comment)
+    self.assertNotIn("$env:TEMP", install_text)
+    self.assertNotIn("pyyaml", install_non_comment)
+    self.assertIn("channels\\install-$ModeSlug.ps1", install_text)
+
+    admin_block = re.search(r"\$AdminSettings = @\{\n(.*?)\n\}\n", install_text, re.DOTALL)
+    self.assertIsNotNone(admin_block)
+    admin_text = admin_block.group(1)
+    self.assertEqual(
+        re.findall(r"^    ([A-Za-z]+) = ", admin_text, re.MULTILINE),
+        ["caCertPath", "authControls", "pluginControls"],
+    )
+    auth_block = re.search(r"authControls = @\{\n(.*?)\n    \}", admin_text, re.DOTALL)
+    plugin_block = re.search(r"pluginControls = @\{\n(.*?)\n    \}", admin_text, re.DOTALL)
+    self.assertEqual(
+        re.findall(r"^        ([A-Za-z]+) = ", auth_block.group(1), re.MULTILINE),
+        ["wifProvider", "disableConsumerLogin"],
+    )
+    self.assertEqual(
+        re.findall(r"^        ([A-Za-z]+) = ", plugin_block.group(1), re.MULTILINE),
+        ["pluginsDisabled", "marketplaceDisabled"],
+    )
+
+    with open(os.path.join(plugin_root, "hooks.json"), "r", encoding="utf-8") as f:
+      plugin_hooks = json.load(f)
+    self.assertEqual(
+        sorted(plugin_hooks["fsi-model-armor-guard"]),
+        ["PostInvocation", "PreInvocation", "PreToolUse", "enabled"],
+    )
+    hooks_block = re.search(r"\$GoldenHooksObj = @\{\n(.*?)\n\}\n", install_text, re.DOTALL)
+    self.assertIsNotNone(hooks_block)
+    hooks_text = hooks_block.group(1)
+    self.assertEqual(hooks_text.count('type = "command"'), 3)
+    for event in ("pre_invocation", "pre_tool_use", "post_invocation"):
+      self.assertEqual(hooks_text.count(f"--event={event}"), 1)
+
 
 if __name__ == "__main__":
   unittest.main()
