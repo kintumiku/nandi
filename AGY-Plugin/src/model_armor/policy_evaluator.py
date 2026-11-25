@@ -98,6 +98,19 @@ class ModelArmorPolicyEvaluator:
 
         filter_res = response.filter_results or {}
 
+        if response.filter_match_state != "MATCH_FOUND":
+            return ModelArmorEvaluationReport(
+                is_allowed=True,
+                decision="allow",
+                reason="Model Armor Security Gate Passed: No adversarial, toxic, or malicious indicators found.",
+                risk_score=0.0,
+                violations_detected=[],
+                filter_details=filter_res,
+                rbi_compliance_codes=[],
+                sebi_compliance_codes=[],
+                latency_ms=response.latency_ms,
+            )
+
         # 1. Evaluate Prompt Injection & Jailbreak
         pi_jb_wrapper = filter_res.get("pi_and_jailbreak", {})
         pi_jb = pi_jb_wrapper.get("piAndJailbreakFilterResult") or pi_jb_wrapper.get("pi_and_jailbreak_filter_result", {})
@@ -170,34 +183,27 @@ class ModelArmorPolicyEvaluator:
             sebi_codes.append("SEBI-CSCRF-AI-01")
 
         # 6. Fallback if overall MATCH_FOUND but specific filter detail unparsed
-        if response.filter_match_state == "MATCH_FOUND" and not violations:
+        if not violations:
             risk_score = max(risk_score, 0.90)
             violations.append("Model Armor Security Filter Triggered (MATCH_FOUND)")
             rbi_codes.append("RBI-ITG-SEC-02")
             sebi_codes.append("SEBI-CSCRF-AI-01")
 
         # 7. Determine Decision
-        has_violations = len(violations) > 0 or response.filter_match_state == "MATCH_FOUND"
-
-        if has_violations:
-            if self.action_on_match == "BLOCK":
-                decision = "deny"
-                is_allowed = False
-            elif self.action_on_match == "FORCE_ASK":
-                decision = "force_ask"
-                is_allowed = False
-            else:
-                decision = "allow"
-                is_allowed = True
-
-            reason = (
-                f"Model Armor Security Gate Denied Prompt: {'; '.join(violations)}. "
-                f"Regulatory Mandates Triggered: {', '.join(sorted(set(rbi_codes + sebi_codes)))}. Risk Score: {round(risk_score, 2)}."
-            )
-        else:
+        if self.action_on_match == "FORCE_ASK":
+            decision = "force_ask"
+            is_allowed = False
+        elif self.action_on_match == "ALLOW":
             decision = "allow"
             is_allowed = True
-            reason = "Model Armor Security Gate Passed: No adversarial, toxic, or malicious indicators found."
+        else:
+            decision = "deny"
+            is_allowed = False
+
+        reason = (
+            f"Model Armor Security Gate Denied Prompt: {'; '.join(violations)}. "
+            f"Regulatory Mandates Triggered: {', '.join(sorted(set(rbi_codes + sebi_codes)))}. Risk Score: {round(risk_score, 2)}."
+        )
 
         return ModelArmorEvaluationReport(
             is_allowed=is_allowed,

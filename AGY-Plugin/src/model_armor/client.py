@@ -1,6 +1,7 @@
 """Google Cloud Model Armor REST Client with ADC Auth & Retry Logic."""
 
 import dataclasses
+import functools
 import json
 import os
 import re
@@ -12,6 +13,15 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, Optional
 
+try:
+    from google import auth as google_auth
+    from google.auth.transport import requests as google_auth_requests
+except ImportError:
+    google_auth = None  # type: ignore[assignment]
+    google_auth_requests = None  # type: ignore[assignment]
+
+TOKEN_FILE_MAX_AGE_SECONDS = 3000
+
 
 @dataclasses.dataclass
 class ModelArmorRequest:
@@ -20,7 +30,7 @@ class ModelArmorRequest:
     location: str
     template_id: str
     user_prompt: str
-    enable_multi_language: bool = True
+    enable_multi_language: Optional[bool] = None
     source_language: Optional[str] = None
 
     @property
@@ -34,12 +44,12 @@ class ModelArmorRequest:
                 "text": self.user_prompt
             }
         }
-        if self.enable_multi_language:
-            payload["multi_language_detection_metadata"] = {
-                "enable_multi_language_detection": True
-            }
+        if self.enable_multi_language is not None or self.source_language:
+            enabled = True if self.enable_multi_language is None else bool(self.enable_multi_language)
+            metadata: Dict[str, Any] = {"enable_multi_language_detection": enabled}
             if self.source_language:
-                payload["multi_language_detection_metadata"]["source_language"] = self.source_language
+                metadata["source_language"] = self.source_language
+            payload["multi_language_detection_metadata"] = metadata
         return payload
 
 
@@ -82,6 +92,74 @@ def _resolve_config_field(
     )
 
 
+_MODEL_ARMOR_SECTION_RE = re.compile(
+    r"^model_armor:[ \t]*(?:#.*)?\r?\n((?:^[ \t]+.*\r?\n?|^[ \t]*\r?\n)*)",
+    re.MULTILINE,
+)
+
+
+def load_model_armor_config(config_path: Optional[str] = None) -> Dict[str, str]:
+    """Loads model_armor connection and token-cache settings from config.yaml."""
+    cfg_file = config_path or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "config",
+        "config.yaml",
+    )
+    try:
+        with open(cfg_file, "r", encoding="utf-8") as cfg_fh:
+            cfg_text = cfg_fh.read()
+    except OSError:
+        return {}
+
+    section_match = _MODEL_ARMOR_SECTION_RE.search(cfg_text)
+    section_text = section_match.group(1) if section_match else cfg_text
+    parsed: Dict[str, str] = {}
+    for key in (*_CONFIG_FIELDS, "token_file"):
+        match = re.search(rf'^[ \t]+{key}:[ \t]*["\']?([^"\'#\r\n]+)["\']?', section_text, re.MULTILINE)
+        if match:
+            val = match.group(1).strip()
+            if val:
+                parsed[key] = val
+    return parsed
+
+
+def _resolve_default_token_file(cfg_values: Optional[Dict[str, str]] = None) -> str:
+    """Resolves the cached access-token file path with Windows enterprise defaults."""
+    env_path = os.environ.get("GCP_ACCESS_TOKEN_FILE", "").strip()
+    if env_path:
+        return os.path.expanduser(os.path.expandvars(env_path))
+    if cfg_values and cfg_values.get("token_file", "").strip():
+        return os.path.expanduser(os.path.expandvars(cfg_values["token_file"].strip()))
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            user_cache = os.path.join(local_app_data, "Nandi", "cache", "access_token")
+            if os.path.exists(user_cache):
+                return user_cache
+        program_data = os.environ.get("ProgramData", r"C:\ProgramData").strip()
+        machine_cache = os.path.join(program_data, "Nandi", "cache", "access_token")
+        if os.path.exists(machine_cache):
+            return machine_cache
+    return os.path.expanduser("~/.config/gcloud/access_token")
+
+
+def _read_fresh_token_file(
+    token_file: str,
+    max_age_seconds: int = TOKEN_FILE_MAX_AGE_SECONDS,
+    now: Optional[float] = None,
+) -> Optional[str]:
+    """Reads a bearer token from disk if the file is younger than max_age_seconds."""
+    try:
+        stat_result = os.stat(token_file)
+        current_time = time.time() if now is None else now
+        if (current_time - stat_result.st_mtime) >= max_age_seconds:
+            return None
+        with open(token_file, "r", encoding="utf-8") as token_fh:
+            return token_fh.read().strip() or None
+    except OSError:
+        return None
+
+
 class ModelArmorClient:
     """Client for Google Cloud Model Armor API (modelarmor.googleapis.com)."""
 
@@ -96,44 +174,26 @@ class ModelArmorClient:
         endpoint: Optional[str] = None,
         timeout_seconds: float = 5.0,
         retry_attempts: int = 2,
+        config_path: Optional[str] = None,
     ):
-        cfg_values: Dict[str, str] = {}
-        try:
-            cfg_file = os.path.join(
-                os.path.dirname(
-                    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                ),
-                "config",
-                "config.yaml",
-            )
-            if os.path.exists(cfg_file):
-                with open(cfg_file, "r", encoding="utf-8") as cfg_fh:
-                    cfg_text = cfg_fh.read()
-                for key in _CONFIG_FIELDS:
-                    match = re.search(
-                        rf'^\s*{key}:\s*["\']?([^"\'#\r\n]+)["\']?',
-                        cfg_text,
-                        re.MULTILINE,
-                    )
-                    if match:
-                        cfg_values[key] = match.group(1).strip()
-        except OSError:
-            # Fall back to environment or default values if config.yaml cannot be read.
-            pass
-
+        cfg_values = load_model_armor_config(config_path=config_path)
         self.project_id = _resolve_config_field("project_id", project_id, cfg_values)
         self.location = _resolve_config_field("location", location, cfg_values)
         self.template_id = _resolve_config_field("template_id", template_id, cfg_values)
         self.endpoint = endpoint or os.environ.get("MODEL_ARMOR_ENDPOINT")
+        self.token_file: Optional[str] = cfg_values.get("token_file")
         self.timeout_seconds = timeout_seconds
         self.retry_attempts = retry_attempts
 
-    def _get_auth_token(self) -> Optional[str]:
+    def _get_auth_token(self, skip_token_file: bool = False) -> Optional[str]:
         """Retrieves GCP OAuth2 access token via environment, token file, google-auth ADC, or gcloud."""
         if os.environ.get("MODEL_ARMOR_NO_AUTH") == "1":
             return None
 
-        if ModelArmorClient._auth_attempted:
+        if skip_token_file:
+            ModelArmorClient._cached_token = None
+            ModelArmorClient._auth_attempted = False
+        elif ModelArmorClient._auth_attempted:
             return ModelArmorClient._cached_token
 
         # 1. Check environment variable first
@@ -143,32 +203,27 @@ class ModelArmorClient:
             ModelArmorClient._auth_attempted = True
             return ModelArmorClient._cached_token
 
-        # 2. Check token file if configured or at ~/.config/gcloud/access_token
-        token_file = os.environ.get("GCP_ACCESS_TOKEN_FILE") or os.path.expanduser("~/.config/gcloud/access_token")
-        if os.path.exists(token_file):
+        # 2. Check cached token file (only if fresh: < TOKEN_FILE_MAX_AGE_SECONDS)
+        if not skip_token_file:
+            token_file = _resolve_default_token_file({"token_file": self.token_file} if self.token_file else None)
+            file_token = _read_fresh_token_file(token_file)
+            if file_token:
+                ModelArmorClient._cached_token = file_token
+                ModelArmorClient._auth_attempted = True
+                return ModelArmorClient._cached_token
+
+        # 3. Try in-process google.auth Application Default Credentials (bounded timeout <= 8.0s)
+        if google_auth is not None and google_auth_requests is not None:
             try:
-                with open(token_file, "r", encoding="utf-8") as f:
-                    file_token = f.read().strip()
-                if file_token:
-                    ModelArmorClient._cached_token = file_token
+                creds, _ = google_auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+                auth_req = functools.partial(google_auth_requests.Request(), timeout=min(self.timeout_seconds, 8.0))
+                creds.refresh(auth_req)
+                if creds.token:
+                    ModelArmorClient._cached_token = creds.token
                     ModelArmorClient._auth_attempted = True
                     return ModelArmorClient._cached_token
             except Exception:
                 pass
-
-        # 3. Try in-process google.auth Application Default Credentials (fast, no subprocess)
-        try:
-            import google.auth
-            import google.auth.transport.requests
-            creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-            auth_req = google.auth.transport.requests.Request()
-            creds.refresh(auth_req)
-            if creds.token:
-                ModelArmorClient._cached_token = creds.token
-                ModelArmorClient._auth_attempted = True
-                return ModelArmorClient._cached_token
-        except Exception:
-            pass
 
         # 3b. Dependency-free stdlib ADC refresh (works in clean .venv without requests and uses Windows OS cert store for Zscaler)
         adc_candidates = []
@@ -289,7 +344,9 @@ class ModelArmorClient:
         }
 
         last_error = None
-        for attempt in range(self.retry_attempts + 1):
+        retried_auth = False
+        attempt = 0
+        while attempt <= self.retry_attempts:
             try:
                 http_req = urllib.request.Request(url, data=payload_bytes, headers=headers, method="POST")
                 with urllib.request.urlopen(http_req, timeout=self.timeout_seconds) as resp:
@@ -313,12 +370,21 @@ class ModelArmorClient:
             except urllib.error.HTTPError as e:
                 err_content = e.read().decode("utf-8", errors="ignore")
                 last_error = f"HTTP {e.code}: {e.reason} - {err_content}"
-                if e.code in (400, 403, 404):
+                if e.code == 401 and not retried_auth:
+                    retried_auth = True
+                    refreshed_token = self._get_auth_token(skip_token_file=True)
+                    if refreshed_token:
+                        headers["Authorization"] = f"Bearer {refreshed_token}"
+                        continue
+                    break
+                if e.code in (400, 401, 403, 404):
                     break
             except Exception as e:
                 last_error = str(e)
 
-            time.sleep(0.1 * (2 ** attempt))
+            if attempt < self.retry_attempts:
+                time.sleep(0.1 * (2 ** attempt))
+            attempt += 1
 
         # Fail-closed: if live Model Armor call fails, return failure response so prompt is blocked
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
