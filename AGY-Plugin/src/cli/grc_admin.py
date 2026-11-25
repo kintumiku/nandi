@@ -11,6 +11,7 @@ plugin_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__
 if plugin_root not in sys.path:
     sys.path.insert(0, plugin_root)
 
+from src.governance.audit_logger import resolve_audit_log_path
 from src.governance.rbi_controls import RBIComplianceController
 from src.governance.sebi_controls import SEBIComplianceController
 from src.model_armor.client import ModelArmorClient
@@ -123,7 +124,7 @@ def cmd_test_entity(args: argparse.Namespace) -> None:
 
 def cmd_show_audit(args: argparse.Namespace) -> None:
     """Displays and verifies the integrity of local FSI audit logs."""
-    log_path = os.path.join(plugin_root, "logs", "fsi_audit.log")
+    log_path = resolve_audit_log_path()
     if not os.path.exists(log_path):
         print(f"No audit log file found at {log_path}")
         return

@@ -6,8 +6,59 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 import uuid
 from typing import Any, Dict, List, Optional
+
+
+def resolve_audit_log_path(explicit_path: Optional[str] = None) -> str:
+    """Resolves the audit log path for read-only inspection without creating files."""
+    if explicit_path:
+        return explicit_path
+    env_log_path = os.environ.get("FSI_AUDIT_LOG_PATH", "").strip()
+    if env_log_path:
+        return env_log_path
+
+    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    default_path = os.path.join(base_dir, "logs", "fsi_audit.log")
+    if os.path.exists(default_path):
+        return default_path
+
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app_data:
+        local_path = os.path.join(local_app_data, "Nandi", "logs", "fsi_audit.log")
+        if os.path.exists(local_path):
+            return local_path
+
+    temp_path = os.path.join(tempfile.gettempdir(), "nandi_logs", "fsi_audit.log")
+    if os.path.exists(temp_path):
+        return temp_path
+
+    if local_app_data:
+        return os.path.join(local_app_data, "Nandi", "logs", "fsi_audit.log")
+    return default_path
+
+
+def _resolve_writable_log_path(explicit_path: Optional[str]) -> str:
+    """Resolves a writable audit log path, falling back to per-user app data when read-only."""
+    if explicit_path:
+        return explicit_path
+    env_log_path = os.environ.get("FSI_AUDIT_LOG_PATH", "").strip()
+    if env_log_path:
+        return env_log_path
+
+    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    default_path = os.path.join(base_dir, "logs", "fsi_audit.log")
+    try:
+        os.makedirs(os.path.dirname(default_path), exist_ok=True)
+        with open(default_path, "a", encoding="utf-8"):
+            pass
+        return default_path
+    except OSError:
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            return os.path.join(local_app_data, "Nandi", "logs", "fsi_audit.log")
+        return os.path.join(tempfile.gettempdir(), "nandi_logs", "fsi_audit.log")
 
 
 @dataclasses.dataclass
@@ -76,23 +127,15 @@ class FSIAuditLogger:
         emit_to_stderr: bool = True,
         salt: str = "FSI_GRC_SALT_INDIA_2026",
     ):
-        if not log_file_path:
-            env_log_path = os.environ.get("FSI_AUDIT_LOG_PATH")
-            if env_log_path:
-                log_file_path = env_log_path
-            else:
-                base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-                log_file_path = os.path.join(base_dir, "logs", "fsi_audit.log")
-
-        self.log_file_path = log_file_path
+        self.log_file_path = _resolve_writable_log_path(log_file_path)
         self.emit_to_stderr = emit_to_stderr
         self.salt = salt
         self.last_hash = "GENESIS_BLOCK_FSI_INDIA_0000000000000000"
 
         try:
             os.makedirs(os.path.dirname(self.log_file_path), exist_ok=True)
-        except OSError:
-            pass
+        except OSError as exc:
+            sys.stderr.write(f"[FSI-AUDIT-WARN] Unable to create audit log directory for {self.log_file_path}: {exc}\n")
         self._recover_last_hash()
 
     def _recover_last_hash(self) -> None:
@@ -157,8 +200,8 @@ class FSIAuditLogger:
         try:
             with open(self.log_file_path, "a", encoding="utf-8") as f:
                 f.write(entry_json + "\n")
-        except OSError:
-            pass
+        except OSError as exc:
+            sys.stderr.write(f"[FSI-AUDIT-WARN] Failed to persist audit entry to {self.log_file_path}: {exc}\n")
 
         # Emit to stderr if enabled
         if self.emit_to_stderr:
